@@ -1,1213 +1,1213 @@
--- ============================================================
---   auto mod v1  v3  |  自分のゲーム / Studio専用
---   追加: ESPヒットボックス / プレイヤー選択UI / 追跡(J) / AC強化
--- ============================================================
-
-local Players          = game:GetService("Players")
-local RunService       = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local TweenService     = game:GetService("TweenService")
-local Workspace        = game:GetService("Workspace")
-local Lighting         = game:GetService("Lighting")
-local CoreGui          = game:GetService("CoreGui")
-local ReplicatedStorage= game:GetService("ReplicatedStorage")
-local Camera           = Workspace.CurrentCamera
-
-local LP   = Players.LocalPlayer
-local Mouse= LP:GetMouse()
-
--- 既存GUI削除
-pcall(function()
-    local old = CoreGui:FindFirstChild("AutoModV1")
-    if old then old:Destroy() end
-end)
-
--- ============================================================
---  STATE
--- ============================================================
-local State = {
-    fly             = false,
-    flySpeed        = 50,
-    walkingFly      = false,
-    walkingFlySpeed = 30,
-    noclip          = false,
-    infinityJump    = false,
-    esp             = false,
-    espHitbox       = false,
-    speedBoost      = false,
-    rocket          = false,
-    recon           = false,
-    map             = false,
-    fixBody         = false,
-    optimization    = false,
-    partTransparent = false,
-    walkSpeed       = 16,
-    jumpPower       = 50,
-    follow          = false,      -- 追跡モード
-    selectedPlayer  = nil,        -- 選択中のPlayer
-    antiKnockback      = false,    -- 吹っ飛び無効化
-    antiRagdoll        = false,    -- ラグドール無効化
-    blockRemoteTeleport= false,    -- ゲーム内テレポートブロック (4キー)
-}
-
--- ============================================================
---  ██  ANTI-CHEAT HARDENING (強化版)  ██
--- ============================================================
-
--- [AC-1] SimulationRadius 最大維持
-task.spawn(function()
-    while task.wait(0.35) do
-        pcall(function()
-            LP.SimulationRadius        = math.huge
-            LP.MaximumSimulationRadius = math.huge
-        end)
-    end
-end)
-
--- [AC-2] ReplicationFocus 固定
-task.spawn(function()
-    while task.wait(0.25) do
-        pcall(function()
-            local hr = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
-            LP.ReplicationFocus = hr or Workspace
-        end)
-    end
-end)
-
--- [AC-3] NetworkOwnership 定期取得
-local function claimOwnership()
-    pcall(function()
-        local chr = LP.Character; if not chr then return end
-        for _, p in ipairs(chr:GetDescendants()) do
-            if p:IsA("BasePart") then
-                pcall(function() p:SetNetworkOwner(LP) end)
-            end
-        end
-    end)
-end
-task.spawn(function() while task.wait(0.8) do claimOwnership() end end)
-
--- [AC-4] WalkSpeed 引き戻し対策
---   Humanoid.WalkSpeed を外部から書き換えられたら即座に戻す
-local function guardHumanoidStats(hum)
-    if not hum then return end
-    pcall(function()
-        -- WalkSpeed 監視
-        hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
-            local expected = State.speedBoost and (State.walkSpeed+30) or State.walkSpeed
-            if math.abs(hum.WalkSpeed - expected) > 0.5 then
-                task.wait()
-                pcall(function() hum.WalkSpeed = expected end)
-            end
-        end)
-        -- JumpPower 監視
-        hum:GetPropertyChangedSignal("JumpPower"):Connect(function()
-            if math.abs(hum.JumpPower - State.jumpPower) > 0.5 then
-                task.wait()
-                pcall(function() hum.JumpPower = State.jumpPower end)
-            end
-        end)
-        -- Sit 強制解除
-        hum:GetPropertyChangedSignal("Sit"):Connect(function()
-            if hum.Sit then task.wait(); pcall(function() hum.Sit = false end) end
-        end)
-        -- PlatformStand 監視（Fly以外では解除）
-        hum:GetPropertyChangedSignal("PlatformStand"):Connect(function()
-            if not State.fly and hum.PlatformStand then
-                task.wait(); pcall(function() hum.PlatformStand = false end)
-            end
-        end)
-
-        -- ラグドール無効: HumanoidStateType.Ragdoll / FallingDown を即座にキャンセル
-        hum.StateChanged:Connect(function(_, new)
-            if State.antiRagdoll then
-                if new == Enum.HumanoidStateType.Ragdoll
-                or new == Enum.HumanoidStateType.FallingDown then
-                    task.wait()
-                    pcall(function()
-                        hum:ChangeState(Enum.HumanoidStateType.GettingUp)
-                    end)
-                end
-            end
-        end)
-    end)
-end
-
--- 吹っ飛び無効: HumanoidRootPart の Velocity を毎フレーム監視してキャンセル
--- (RenderSteppedループ内で処理するため関数化)
-local function applyAntiKnockback(hr)
-    -- Velocity が大きすぎるとき水平方向をゼロに戻す
-    local vel = hr.AssemblyLinearVelocity
-    -- 垂直（Y）は Fly/Rocket/Jump で使うので水平のみ制限
-    local horizSpeed = Vector2.new(vel.X, vel.Z).Magnitude
-    if horizSpeed > 60 then
-        hr.AssemblyLinearVelocity = Vector3.new(0, vel.Y, 0)
-    end
-end
-
--- [AC-5] 位置監視ガード
-local guardedPos  = nil
-local guardActive = false
-local guardPaused = false
-
-local function startPositionGuard()
-    if guardActive then return end
-    guardActive = true
-    task.spawn(function()
-        while guardActive do
-            task.wait(0.05)
-            if guardPaused then continue end
-            local chr = LP.Character
-            local hr  = chr and chr:FindFirstChild("HumanoidRootPart")
-            if hr and guardedPos then
-                local delta = (hr.Position - guardedPos).Magnitude
-                -- 追跡中は大きく動くので判定を緩める
-                local threshold = State.follow and 999 or 60
-                if delta > threshold then
-                    pcall(function()
-                        hr.CFrame      = CFrame.new(guardedPos)
-                        hr.Velocity    = Vector3.zero
-                        hr.RotVelocity = Vector3.zero
-                    end)
-                end
-            end
-            if hr then guardedPos = hr.Position end
-        end
-    end)
-end
-
--- [AC-6] RemoteEvent フック（位置リセット系をブロック）
---   State.blockRemoteTeleport が true のときだけ無視する
-local function hookRemotes()
-    pcall(function()
-        for _, v in ipairs(ReplicatedStorage:GetDescendants()) do
-            if v:IsA("RemoteEvent") then
-                pcall(function()
-                    v.OnClientEvent:Connect(function(...)
-                        -- blockRemoteTeleport ON のときだけ何もしない
-                        -- OFF のときは通常通りゲーム側の処理が動く
-                        -- ※ここでは「追加リスナー」として登録するだけなので
-                        --   ゲーム本来の処理は別のConnectで動き続ける
-                        if State.blockRemoteTeleport then return end
-                    end)
-                end)
-            end
-        end
-    end)
-    ReplicatedStorage.DescendantAdded:Connect(function(v)
-        if v:IsA("RemoteEvent") then
-            pcall(function()
-                v.OnClientEvent:Connect(function(...)
-                    if State.blockRemoteTeleport then return end
-                end)
-            end)
-        end
-    end)
-end
-task.spawn(hookRemotes)
-
--- ============================================================
---  SAFE TELEPORT
--- ============================================================
-local function safeTeleport(targetPos)
-    local chr = LP.Character
-    local hr  = chr and chr:FindFirstChild("HumanoidRootPart")
-    if not hr then return end
-    local hum = chr:FindFirstChildWhichIsA("Humanoid")
-
-    guardPaused = true
-
-    -- 干渉する BodyMover を一時削除
-    for _, name in ipairs({"FlyBP","FlyBG","WalkFlyBP","TpBP","FollowBP"}) do
-        local m = hr:FindFirstChild(name); if m then m:Destroy() end
-    end
-    if hum then hum.PlatformStand = false end
-
-    local dest = targetPos + Vector3.new(0, 3, 0)
-    local bp = Instance.new("BodyPosition")
-    bp.Name = "TpBP"; bp.MaxForce = Vector3.new(math.huge,math.huge,math.huge)
-    bp.P = 2e6; bp.D = 2000; bp.Position = dest; bp.Parent = hr
-
-    task.spawn(function()
-        for i = 1, 10 do
-            task.wait()
-            pcall(function()
-                hr.CFrame = CFrame.new(dest)
-                hr.Velocity = Vector3.zero; hr.RotVelocity = Vector3.zero
-            end)
-        end
-        task.wait(0.3)
-        pcall(function() bp:Destroy() end)
-
-        -- Fly再アタッチ
-        if State.fly then
-            local newBP = Instance.new("BodyPosition"); newBP.Name="FlyBP"
-            newBP.MaxForce=Vector3.new(math.huge,math.huge,math.huge)
-            newBP.P=1e5; newBP.D=500; newBP.Position=dest; newBP.Parent=hr
-            local newBG = Instance.new("BodyGyro"); newBG.Name="FlyBG"
-            newBG.MaxTorque=Vector3.new(math.huge,math.huge,math.huge)
-            newBG.P=1e4; newBG.Parent=hr
-            if hum then hum.PlatformStand=true end
-        end
-
-        guardedPos  = dest
-        guardPaused = false
-    end)
-end
-
--- ============================================================
---  GUI カラー定義
--- ============================================================
-local C = {
-    bg        = Color3.fromRGB(10,  12,  22),
-    accent    = Color3.fromRGB(74, 158, 255),
-    accentDim = Color3.fromRGB(30,  70, 130),
-    text      = Color3.fromRGB(176, 196, 232),
-    textBright= Color3.fromRGB(220, 235, 255),
-    sep       = Color3.fromRGB(30,  40,  70),
-    toggleOff = Color3.fromRGB(40,  45,  70),
-    toggleOn  = Color3.fromRGB(74, 158, 255),
-    red       = Color3.fromRGB(255, 80,  80),
-    green     = Color3.fromRGB(80, 220, 120),
-    orange    = Color3.fromRGB(255, 160,  50),
-}
-
--- ============================================================
---  SCREEN GUI
--- ============================================================
-local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name="AutoModV1"; ScreenGui.ResetOnSpawn=false
-ScreenGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
-ScreenGui.Parent=CoreGui
-
--- Main Frame
-local MainFrame = Instance.new("Frame")
-MainFrame.Size=UDim2.new(0,460,0,640)
-MainFrame.Position=UDim2.new(0,40,0,40)
-MainFrame.BackgroundColor3=C.bg; MainFrame.BorderSizePixel=0
-MainFrame.Active=true; MainFrame.Draggable=true; MainFrame.Parent=ScreenGui
-Instance.new("UICorner",MainFrame).CornerRadius=UDim.new(0,12)
-local mStroke=Instance.new("UIStroke",MainFrame)
-mStroke.Color=Color3.fromRGB(60,120,220); mStroke.Thickness=1
-
--- Title bar
-local TitleBar=Instance.new("Frame")
-TitleBar.Size=UDim2.new(1,0,0,36)
-TitleBar.BackgroundColor3=Color3.fromRGB(12,20,45)
-TitleBar.BorderSizePixel=0; TitleBar.Parent=MainFrame
-Instance.new("UICorner",TitleBar).CornerRadius=UDim.new(0,12)
-
-local TitleLbl=Instance.new("TextLabel",TitleBar)
-TitleLbl.Size=UDim2.new(1,-90,1,0); TitleLbl.Position=UDim2.new(0,14,0,0)
-TitleLbl.BackgroundTransparency=1; TitleLbl.Text="◈  auto mod  v1"
-TitleLbl.TextColor3=C.accent; TitleLbl.Font=Enum.Font.GothamBold
-TitleLbl.TextSize=14; TitleLbl.TextXAlignment=Enum.TextXAlignment.Left
-
-local Dot=Instance.new("Frame",TitleBar)
-Dot.Size=UDim2.new(0,8,0,8); Dot.Position=UDim2.new(1,-94,0.5,-4)
-Dot.BackgroundColor3=C.green; Dot.BorderSizePixel=0
-Instance.new("UICorner",Dot).CornerRadius=UDim.new(1,0)
-
-local function mkTitleBtn(x,bg,txt,clr)
-    local b=Instance.new("TextButton",TitleBar)
-    b.Size=UDim2.new(0,28,0,28); b.Position=UDim2.new(1,x,0,4)
-    b.BackgroundColor3=bg; b.Text=txt; b.TextColor3=clr
-    b.Font=Enum.Font.Gotham; b.TextSize=13; b.BorderSizePixel=0
-    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6)
-    return b
-end
-local CloseBtn=mkTitleBtn(-34,Color3.fromRGB(60,30,40),"✕",Color3.fromRGB(200,100,100))
-local MinBtn  =mkTitleBtn(-68,Color3.fromRGB(30,50,80),"—",C.accent)
-CloseBtn.MouseButton1Click:Connect(function() MainFrame.Visible=false end)
-
--- Content ScrollingFrame
-local Content=Instance.new("ScrollingFrame")
-Content.Size=UDim2.new(1,0,1,-36); Content.Position=UDim2.new(0,0,0,36)
-Content.BackgroundTransparency=1; Content.BorderSizePixel=0
-Content.ScrollBarThickness=3; Content.ScrollBarImageColor3=C.accent
-Content.CanvasSize=UDim2.new(0,0,0,0); Content.AutomaticCanvasSize=Enum.AutomaticSize.Y
-Content.Parent=MainFrame
-Instance.new("UIListLayout",Content).Padding=UDim.new(0,0)
-local cPad=Instance.new("UIPadding",Content)
-cPad.PaddingLeft=UDim.new(0,12); cPad.PaddingRight=UDim.new(0,12)
-cPad.PaddingTop=UDim.new(0,8); cPad.PaddingBottom=UDim.new(0,12)
-
-local minimized=false
-MinBtn.MouseButton1Click:Connect(function()
-    minimized=not minimized; Content.Visible=not minimized
-    MainFrame.Size=minimized and UDim2.new(0,460,0,36) or UDim2.new(0,460,0,640)
-end)
-
--- ── UI ヘルパー ────────────────────────────────────────────
-local function mkSection(lbl)
-    local f=Instance.new("Frame",Content)
-    f.Size=UDim2.new(1,0,0,26); f.BackgroundTransparency=1
-    local l=Instance.new("TextLabel",f)
-    l.Size=UDim2.new(1,0,1,0); l.BackgroundTransparency=1
-    l.Text="▸  "..lbl; l.TextColor3=C.accent
-    l.Font=Enum.Font.GothamBold; l.TextSize=11
-    l.TextXAlignment=Enum.TextXAlignment.Left
-    local sep=Instance.new("Frame",f)
-    sep.Size=UDim2.new(1,0,0,1); sep.Position=UDim2.new(0,0,1,-1)
-    sep.BackgroundColor3=C.sep; sep.BorderSizePixel=0
-end
-
-local function mkSpacer(h)
-    local f=Instance.new("Frame",Content)
-    f.Size=UDim2.new(1,0,0,h or 6); f.BackgroundTransparency=1
-end
-
-local function mkToggle(lbl, stateKey, onChange)
-    local row=Instance.new("Frame",Content)
-    row.Size=UDim2.new(1,0,0,34); row.BackgroundTransparency=1
-    local label=Instance.new("TextLabel",row)
-    label.Size=UDim2.new(1,-56,1,0); label.BackgroundTransparency=1
-    label.Text=lbl; label.TextColor3=C.text
-    label.Font=Enum.Font.Gotham; label.TextSize=13
-    label.TextXAlignment=Enum.TextXAlignment.Left
-    local track=Instance.new("Frame",row)
-    track.Size=UDim2.new(0,38,0,20); track.Position=UDim2.new(1,-44,0.5,-10)
-    track.BackgroundColor3=State[stateKey] and C.toggleOn or C.toggleOff
-    track.BorderSizePixel=0
-    Instance.new("UICorner",track).CornerRadius=UDim.new(1,0)
-    local thumb=Instance.new("Frame",track)
-    thumb.Size=UDim2.new(0,14,0,14)
-    thumb.Position=State[stateKey] and UDim2.new(0,21,0.5,-7) or UDim2.new(0,3,0.5,-7)
-    thumb.BackgroundColor3=Color3.new(1,1,1); thumb.BorderSizePixel=0
-    Instance.new("UICorner",thumb).CornerRadius=UDim.new(1,0)
-    local btn=Instance.new("TextButton",row)
-    btn.Size=UDim2.new(1,0,1,0); btn.BackgroundTransparency=1; btn.Text=""
-    btn.MouseButton1Click:Connect(function()
-        State[stateKey]=not State[stateKey]
-        local on=State[stateKey]
-        track.BackgroundColor3=on and C.toggleOn or C.toggleOff
-        TweenService:Create(thumb,TweenInfo.new(0.15),{
-            Position=on and UDim2.new(0,21,0.5,-7) or UDim2.new(0,3,0.5,-7)
-        }):Play()
-        if onChange then onChange(on) end
-    end)
-    return {track=track, thumb=thumb}
-end
-
-local function mkSlider(lbl, min, max, default, cb)
-    local row=Instance.new("Frame",Content)
-    row.Size=UDim2.new(1,0,0,46); row.BackgroundTransparency=1
-    local l=Instance.new("TextLabel",row)
-    l.Size=UDim2.new(0.7,0,0,20); l.BackgroundTransparency=1
-    l.Text=lbl; l.TextColor3=C.text; l.Font=Enum.Font.Gotham; l.TextSize=12
-    l.TextXAlignment=Enum.TextXAlignment.Left
-    local vl=Instance.new("TextLabel",row)
-    vl.Size=UDim2.new(0.3,0,0,20); vl.Position=UDim2.new(0.7,0,0,0)
-    vl.BackgroundTransparency=1; vl.Text=tostring(default)
-    vl.TextColor3=C.textBright; vl.Font=Enum.Font.GothamBold; vl.TextSize=12
-    vl.TextXAlignment=Enum.TextXAlignment.Right
-    local track=Instance.new("Frame",row)
-    track.Size=UDim2.new(1,0,0,4); track.Position=UDim2.new(0,0,0,28)
-    track.BackgroundColor3=Color3.fromRGB(30,40,70); track.BorderSizePixel=0
-    Instance.new("UICorner",track).CornerRadius=UDim.new(1,0)
-    local pct=(default-min)/(max-min)
-    local fill=Instance.new("Frame",track)
-    fill.Size=UDim2.new(pct,0,1,0); fill.BackgroundColor3=C.accent; fill.BorderSizePixel=0
-    Instance.new("UICorner",fill).CornerRadius=UDim.new(1,0)
-    local thumb=Instance.new("TextButton",track)
-    thumb.Size=UDim2.new(0,14,0,14); thumb.Position=UDim2.new(pct,-7,0.5,-7)
-    thumb.BackgroundColor3=Color3.new(1,1,1); thumb.Text=""; thumb.BorderSizePixel=0
-    Instance.new("UICorner",thumb).CornerRadius=UDim.new(1,0)
-    local drag=false
-    thumb.MouseButton1Down:Connect(function() drag=true end)
-    UserInputService.InputEnded:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=false end
-    end)
-    RunService.RenderStepped:Connect(function()
-        if not drag then return end
-        local rel=math.clamp((Mouse.X-track.AbsolutePosition.X)/track.AbsoluteSize.X,0,1)
-        local val=math.floor(min+(max-min)*rel)
-        fill.Size=UDim2.new(rel,0,1,0); thumb.Position=UDim2.new(rel,-7,0.5,-7)
-        vl.Text=tostring(val); if cb then cb(val) end
-    end)
-end
-
-local function mkButton(lbl, onClick)
-    local btn=Instance.new("TextButton",Content)
-    btn.Size=UDim2.new(1,0,0,30); btn.BackgroundColor3=C.accentDim
-    btn.Text=lbl; btn.TextColor3=C.accent; btn.Font=Enum.Font.GothamBold
-    btn.TextSize=12; btn.BorderSizePixel=0
-    Instance.new("UICorner",btn).CornerRadius=UDim.new(0,6)
-    Instance.new("UIStroke",btn).Color=C.accent
-    btn.MouseButton1Click:Connect(onClick); return btn
-end
-
--- ============================================================
---  MOVEMENT
--- ============================================================
-mkSection("MOVEMENT")
-mkToggle("Fly", "fly", nil)
-mkSlider("Fly Speed", 10, 200, 50, function(v) State.flySpeed=v end)
-mkToggle("Walking Fly", "walkingFly", nil)
-mkSlider("Walking Fly Speed", 5, 150, 30, function(v) State.walkingFlySpeed=v end)
-mkToggle("Noclip", "noclip", nil)
-mkToggle("Infinity Jump", "infinityJump", nil)
-mkSlider("WalkSpeed", 1, 300, 16, function(v)
-    State.walkSpeed=v
-    local hum=LP.Character and LP.Character:FindFirstChildWhichIsA("Humanoid")
-    if hum then hum.WalkSpeed=v end
-end)
-mkSlider("JumpPower", 10, 500, 50, function(v)
-    State.jumpPower=v
-    local hum=LP.Character and LP.Character:FindFirstChildWhichIsA("Humanoid")
-    if hum then hum.JumpPower=v end
-end)
-mkSpacer(4)
-
--- ============================================================
---  COMBAT / SPECIAL
--- ============================================================
-mkSection("COMBAT / SPECIAL")
-mkToggle("ESP  ─ 名前 + 距離表示 (90–250m)", "esp", nil)
-mkToggle("ESP Hitbox  ─ ヒットボックス表示", "espHitbox", nil)
-mkToggle("SpeedBoost  (+30 WS)", "speedBoost", function(on)
-    local hum=LP.Character and LP.Character:FindFirstChildWhichIsA("Humanoid")
-    if hum then hum.WalkSpeed=on and (State.walkSpeed+30) or State.walkSpeed end
-end)
-mkToggle("Rocket  [P キー]", "rocket", nil)
-mkToggle("Recon  [E キー]  壁貼り付け+ESP", "recon", nil)
-mkToggle("MAP  ─ 俯瞰モード", "map", function(on)
-    Camera.FieldOfView=on and 120 or 70
-    if on then
-        Camera.CameraType=Enum.CameraType.Scriptable
-        Camera.CFrame=CFrame.new(0,800,0)*CFrame.Angles(-math.pi/2,0,0)
-    else
-        Camera.CameraType=Enum.CameraType.Custom
-    end
-end)
-mkSpacer(4)
-
--- ============================================================
---  UTILITY
--- ============================================================
-mkSection("UTILITY")
-mkToggle("FixBody  ─ 一人称で体非表示", "fixBody", function(on)
-    local chr=LP.Character; if not chr then return end
-    for _,p in ipairs(chr:GetDescendants()) do
-        if p:IsA("BasePart") and p.Name~="HumanoidRootPart" then
-            p.LocalTransparencyModifier=on and 1 or 0
-        end
-    end
-end)
-mkToggle("Optimization  ─ 軽量化", "optimization", function(on)
-    for _,p in ipairs(Workspace:GetDescendants()) do
-        if p:IsA("ParticleEmitter") or p:IsA("Smoke") or p:IsA("Fire") or p:IsA("Sparkles") then
-            p.Enabled=not on
-        end
-        if p:IsA("BasePart") then pcall(function() p.CastShadow=not on end) end
-    end
-    Lighting.GlobalShadows=not on
-end)
-mkToggle("PartTransparent  ─ 全パーツ半透明", "partTransparent", function(on)
-    for _,p in ipairs(Workspace:GetDescendants()) do
-        if p:IsA("BasePart") and p.Parent~=LP.Character then
-            p.Transparency=on and 0.6 or 0
-        end
-    end
-end)
-mkToggle("Anti Knockback  ─ 吹っ飛び無効", "antiKnockback", nil)
-mkToggle("Anti Ragdoll  ─ ラグドール無効", "antiRagdoll", nil)
-mkToggle("Block Remote Teleport  [4キー]  ─ 引き戻しブロック", "blockRemoteTeleport", nil)
-mkSpacer(4)
-
--- ============================================================
---  PLAYER SELECT + FOLLOW
--- ============================================================
-mkSection("PLAYER SELECT  /  FOLLOW")
-
--- 選択中プレイヤー表示
-local selDisplay=Instance.new("Frame",Content)
-selDisplay.Size=UDim2.new(1,0,0,30); selDisplay.BackgroundColor3=Color3.fromRGB(14,18,36)
-selDisplay.BorderSizePixel=0
-Instance.new("UICorner",selDisplay).CornerRadius=UDim.new(0,6)
-Instance.new("UIStroke",selDisplay).Color=C.sep
-local selLbl=Instance.new("TextLabel",selDisplay)
-selLbl.Size=UDim2.new(1,-10,1,0); selLbl.Position=UDim2.new(0,10,0,0)
-selLbl.BackgroundTransparency=1; selLbl.Text="選択中: なし"
-selLbl.TextColor3=Color3.fromRGB(100,140,180); selLbl.Font=Enum.Font.Gotham
-selLbl.TextSize=12; selLbl.TextXAlignment=Enum.TextXAlignment.Left
-
-mkSpacer(4)
-
--- プレイヤーリストパネル (サブウィンドウ)
-local PlrPanel=Instance.new("Frame")
-PlrPanel.Size=UDim2.new(0,240,0,280); PlrPanel.Position=UDim2.new(0,500,0,300)
-PlrPanel.BackgroundColor3=C.bg; PlrPanel.BorderSizePixel=0
-PlrPanel.Visible=false; PlrPanel.Active=true; PlrPanel.Draggable=true
-PlrPanel.ZIndex=10; PlrPanel.Parent=ScreenGui
-Instance.new("UICorner",PlrPanel).CornerRadius=UDim.new(0,10)
-local plrStroke=Instance.new("UIStroke",PlrPanel)
-plrStroke.Color=C.orange; plrStroke.Thickness=1
-
-local PlrTitle=Instance.new("TextLabel",PlrPanel)
-PlrTitle.Size=UDim2.new(1,-34,0,28); PlrTitle.Position=UDim2.new(0,10,0,4)
-PlrTitle.BackgroundTransparency=1; PlrTitle.Text="◈  Player Select"
-PlrTitle.TextColor3=C.orange; PlrTitle.Font=Enum.Font.GothamBold
-PlrTitle.TextSize=12; PlrTitle.TextXAlignment=Enum.TextXAlignment.Left
-
-local PlrClose=Instance.new("TextButton",PlrPanel)
-PlrClose.Size=UDim2.new(0,24,0,24); PlrClose.Position=UDim2.new(1,-28,0,4)
-PlrClose.BackgroundColor3=Color3.fromRGB(60,30,40); PlrClose.Text="✕"
-PlrClose.TextColor3=Color3.fromRGB(200,100,100)
-PlrClose.Font=Enum.Font.Gotham; PlrClose.TextSize=12; PlrClose.BorderSizePixel=0
-Instance.new("UICorner",PlrClose).CornerRadius=UDim.new(0,5)
-PlrClose.MouseButton1Click:Connect(function() PlrPanel.Visible=false end)
-
--- Refresh ボタン
-local PlrRefresh=Instance.new("TextButton",PlrPanel)
-PlrRefresh.Size=UDim2.new(1,-20,0,24); PlrRefresh.Position=UDim2.new(0,10,0,36)
-PlrRefresh.BackgroundColor3=Color3.fromRGB(20,50,90); PlrRefresh.Text="🔄 リスト更新"
-PlrRefresh.TextColor3=C.accent; PlrRefresh.Font=Enum.Font.GothamBold
-PlrRefresh.TextSize=11; PlrRefresh.BorderSizePixel=0
-Instance.new("UICorner",PlrRefresh).CornerRadius=UDim.new(0,5)
-
-local PlrScroll=Instance.new("ScrollingFrame",PlrPanel)
-PlrScroll.Size=UDim2.new(1,-20,0,160); PlrScroll.Position=UDim2.new(0,10,0,68)
-PlrScroll.BackgroundColor3=Color3.fromRGB(14,16,30); PlrScroll.BorderSizePixel=0
-PlrScroll.ScrollBarThickness=2; PlrScroll.ScrollBarImageColor3=C.orange
-PlrScroll.CanvasSize=UDim2.new(0,0,0,0); PlrScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y
-Instance.new("UICorner",PlrScroll).CornerRadius=UDim.new(0,6)
-local plrLayout=Instance.new("UIListLayout",PlrScroll); plrLayout.Padding=UDim.new(0,2)
-local plrPad=Instance.new("UIPadding",PlrScroll)
-plrPad.PaddingLeft=UDim.new(0,6); plrPad.PaddingRight=UDim.new(0,6)
-plrPad.PaddingTop=UDim.new(0,4)
-
--- Follow トグル (サブパネル内)
-local followRow=Instance.new("Frame",PlrPanel)
-followRow.Size=UDim2.new(1,-20,0,30); followRow.Position=UDim2.new(0,10,0,238)
-followRow.BackgroundTransparency=1
-local followLbl=Instance.new("TextLabel",followRow)
-followLbl.Size=UDim2.new(0.65,0,1,0); followLbl.BackgroundTransparency=1
-followLbl.Text="Follow  [J キー]"; followLbl.TextColor3=C.text
-followLbl.Font=Enum.Font.Gotham; followLbl.TextSize=12
-followLbl.TextXAlignment=Enum.TextXAlignment.Left
-
-local followTrack=Instance.new("Frame",followRow)
-followTrack.Size=UDim2.new(0,38,0,20); followTrack.Position=UDim2.new(1,-44,0.5,-10)
-followTrack.BackgroundColor3=C.toggleOff; followTrack.BorderSizePixel=0
-Instance.new("UICorner",followTrack).CornerRadius=UDim.new(1,0)
-local followThumb=Instance.new("Frame",followTrack)
-followThumb.Size=UDim2.new(0,14,0,14); followThumb.Position=UDim2.new(0,3,0.5,-7)
-followThumb.BackgroundColor3=Color3.new(1,1,1); followThumb.BorderSizePixel=0
-Instance.new("UICorner",followThumb).CornerRadius=UDim.new(1,0)
-local followBtn=Instance.new("TextButton",followRow)
-followBtn.Size=UDim2.new(1,0,1,0); followBtn.BackgroundTransparency=1; followBtn.Text=""
-followBtn.MouseButton1Click:Connect(function()
-    if not State.selectedPlayer then
-        selLbl.Text="⚠ まずプレイヤーを選択してください"; selLbl.TextColor3=C.red
-        task.delay(2,function() selLbl.TextColor3=Color3.fromRGB(100,140,180) end)
-        return
-    end
-    State.follow=not State.follow
-    local on=State.follow
-    followTrack.BackgroundColor3=on and C.orange or C.toggleOff
-    TweenService:Create(followThumb,TweenInfo.new(0.15),{
-        Position=on and UDim2.new(0,21,0.5,-7) or UDim2.new(0,3,0.5,-7)
-    }):Play()
-    -- 追跡中は位置ガードのしきい値を緩める (startPositionGuardで対応済み)
-end)
-
--- プレイヤーリスト構築
-local function refreshPlayerList()
-    for _,c in ipairs(PlrScroll:GetChildren()) do
-        if c:IsA("TextButton") then c:Destroy() end
-    end
-    for _,plr in ipairs(Players:GetPlayers()) do
-        if plr==LP then continue end
-        local btn=Instance.new("TextButton",PlrScroll)
-        btn.Size=UDim2.new(1,0,0,26)
-        local isSelected = State.selectedPlayer==plr
-        btn.BackgroundColor3=isSelected and Color3.fromRGB(40,80,30) or Color3.fromRGB(20,25,50)
-        btn.Text="  👤 "..plr.Name
-        btn.TextColor3=isSelected and C.green or C.text
-        btn.Font=Enum.Font.Gotham; btn.TextSize=12
-        btn.BorderSizePixel=0; btn.TextXAlignment=Enum.TextXAlignment.Left
-        Instance.new("UICorner",btn).CornerRadius=UDim.new(0,4)
-        btn.MouseButton1Click:Connect(function()
-            State.selectedPlayer=plr
-            selLbl.Text="選択中: "..plr.Name; selLbl.TextColor3=C.green
-            State.follow=false
-            followTrack.BackgroundColor3=C.toggleOff
-            followThumb.Position=UDim2.new(0,3,0.5,-7)
-            refreshPlayerList()
-        end)
-    end
-end
-PlrRefresh.MouseButton1Click:Connect(refreshPlayerList)
-refreshPlayerList()
-
--- プレイヤー追加/削除でリスト自動更新
-Players.PlayerAdded:Connect(function() refreshPlayerList() end)
-Players.PlayerRemoving:Connect(function(plr)
-    if State.selectedPlayer==plr then
-        State.selectedPlayer=nil; State.follow=false
-        selLbl.Text="選択中: なし (退出)"; selLbl.TextColor3=Color3.fromRGB(100,140,180)
-        followTrack.BackgroundColor3=C.toggleOff
-        followThumb.Position=UDim2.new(0,3,0.5,-7)
-    end
-    task.wait(0.1); refreshPlayerList()
-end)
-
-mkButton("👤  Player Select を開く / 閉じる", function()
-    PlrPanel.Visible=not PlrPanel.Visible
-    refreshPlayerList()
-end)
-
-mkSpacer(4)
-
--- ============================================================
---  AC STATUS
--- ============================================================
-mkSection("ANTI-CHEAT STATUS")
-local acFrame=Instance.new("Frame",Content)
-acFrame.Size=UDim2.new(1,0,0,68); acFrame.BackgroundColor3=Color3.fromRGB(8,14,28)
-acFrame.BorderSizePixel=0
-Instance.new("UICorner",acFrame).CornerRadius=UDim.new(0,6)
-Instance.new("UIStroke",acFrame).Color=Color3.fromRGB(30,80,40)
-local acItems={
-    {n="SimRadius",  y=6,  k="simrad"},
-    {n="NetOwner",   y=26, k="netown"},
-    {n="PosGuard",   y=46, k="posguard"},
-}
-local acVals={}
-for _,item in ipairs(acItems) do
-    local a=Instance.new("TextLabel",acFrame)
-    a.Size=UDim2.new(0.5,0,0,16); a.Position=UDim2.new(0,10,0,item.y)
-    a.BackgroundTransparency=1; a.Text=item.n
-    a.TextColor3=Color3.fromRGB(100,140,180); a.Font=Enum.Font.Gotham; a.TextSize=11
-    a.TextXAlignment=Enum.TextXAlignment.Left
-    local v=Instance.new("TextLabel",acFrame)
-    v.Size=UDim2.new(0.48,-4,0,16); v.Position=UDim2.new(0.5,0,0,item.y)
-    v.BackgroundTransparency=1; v.Text="● ACTIVE"; v.TextColor3=C.green
-    v.Font=Enum.Font.GothamBold; v.TextSize=11
-    v.TextXAlignment=Enum.TextXAlignment.Right
-    acVals[item.k]=v
-end
-task.spawn(function()
-    while task.wait(1) do
-        pcall(function()
-            acVals.simrad.Text  ="● "..tostring(math.floor(LP.SimulationRadius))
-            acVals.netown.Text  ="● ACTIVE"
-            acVals.posguard.Text=guardActive and (guardPaused and "● TP中" or "● ON") or "○ OFF"
-        end)
-    end
-end)
-mkSpacer(4)
-
--- ============================================================
---  TELEPORT パネル
--- ============================================================
-mkSection("TELEPORT")
-local savedPositions={}
-
-local TPPanel=Instance.new("Frame")
-TPPanel.Size=UDim2.new(0,320,0,270); TPPanel.Position=UDim2.new(0,500,0,40)
-TPPanel.BackgroundColor3=C.bg; TPPanel.BorderSizePixel=0
-TPPanel.Visible=false; TPPanel.Active=true; TPPanel.Draggable=true
-TPPanel.ZIndex=10; TPPanel.Parent=ScreenGui
-Instance.new("UICorner",TPPanel).CornerRadius=UDim.new(0,10)
-Instance.new("UIStroke",TPPanel).Color=C.accent
-
-local TPTitleLbl=Instance.new("TextLabel",TPPanel)
-TPTitleLbl.Size=UDim2.new(1,-40,0,28); TPTitleLbl.Position=UDim2.new(0,10,0,4)
-TPTitleLbl.BackgroundTransparency=1; TPTitleLbl.Text="◈  Teleport Panel  |  AC+保護"
-TPTitleLbl.TextColor3=C.accent; TPTitleLbl.Font=Enum.Font.GothamBold
-TPTitleLbl.TextSize=12; TPTitleLbl.TextXAlignment=Enum.TextXAlignment.Left
-
-local TPClose=Instance.new("TextButton",TPPanel)
-TPClose.Size=UDim2.new(0,24,0,24); TPClose.Position=UDim2.new(1,-28,0,4)
-TPClose.BackgroundColor3=Color3.fromRGB(60,30,40); TPClose.Text="✕"
-TPClose.TextColor3=Color3.fromRGB(200,100,100)
-TPClose.Font=Enum.Font.Gotham; TPClose.TextSize=12; TPClose.BorderSizePixel=0
-Instance.new("UICorner",TPClose).CornerRadius=UDim.new(0,5)
-TPClose.MouseButton1Click:Connect(function() TPPanel.Visible=false end)
-
-local TPScroll=Instance.new("ScrollingFrame",TPPanel)
-TPScroll.Size=UDim2.new(1,-20,0,150); TPScroll.Position=UDim2.new(0,10,0,36)
-TPScroll.BackgroundColor3=Color3.fromRGB(14,16,30); TPScroll.BorderSizePixel=0
-TPScroll.ScrollBarThickness=2; TPScroll.ScrollBarImageColor3=C.accent
-TPScroll.CanvasSize=UDim2.new(0,0,0,0); TPScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y
-Instance.new("UICorner",TPScroll).CornerRadius=UDim.new(0,6)
-Instance.new("UIListLayout",TPScroll).Padding=UDim.new(0,2)
-local tpPad=Instance.new("UIPadding",TPScroll)
-tpPad.PaddingLeft=UDim.new(0,6); tpPad.PaddingRight=UDim.new(0,6)
-tpPad.PaddingTop=UDim.new(0,4)
-
-local tpEmpty=Instance.new("TextLabel",TPScroll)
-tpEmpty.Size=UDim2.new(1,0,0,30); tpEmpty.BackgroundTransparency=1
-tpEmpty.Text="まだ位置が保存されていません"
-tpEmpty.TextColor3=Color3.fromRGB(60,80,120)
-tpEmpty.Font=Enum.Font.Gotham; tpEmpty.TextSize=11
-
-local function refreshTPList()
-    for _,c in ipairs(TPScroll:GetChildren()) do
-        if c:IsA("TextButton") then c:Destroy() end
-    end
-    tpEmpty.Visible=(#savedPositions==0)
-    for i,pos in ipairs(savedPositions) do
-        local row=Instance.new("TextButton",TPScroll)
-        row.Size=UDim2.new(1,0,0,26)
-        row.BackgroundColor3=Color3.fromRGB(20,25,50)
-        row.Text=string.format("  📍 %d  →  %.0f, %.0f, %.0f",i,pos.X,pos.Y,pos.Z)
-        row.TextColor3=C.text; row.Font=Enum.Font.Gotham; row.TextSize=11
-        row.BorderSizePixel=0; row.TextXAlignment=Enum.TextXAlignment.Left
-        Instance.new("UICorner",row).CornerRadius=UDim.new(0,4)
-        row.MouseEnter:Connect(function()
-            TweenService:Create(row,TweenInfo.new(0.1),{BackgroundColor3=Color3.fromRGB(30,40,80)}):Play()
-        end)
-        row.MouseLeave:Connect(function()
-            TweenService:Create(row,TweenInfo.new(0.1),{BackgroundColor3=Color3.fromRGB(20,25,50)}):Play()
-        end)
-        row.MouseButton1Click:Connect(function()
-            safeTeleport(pos)
-            TweenService:Create(row,TweenInfo.new(0.1),{BackgroundColor3=C.toggleOn}):Play()
-            task.delay(0.4,function()
-                TweenService:Create(row,TweenInfo.new(0.2),{BackgroundColor3=Color3.fromRGB(20,25,50)}):Play()
-            end)
-        end)
-        row.MouseButton2Click:Connect(function()
-            table.remove(savedPositions,i); refreshTPList()
-        end)
-    end
-end
-refreshTPList()
-
-local tpBtnFrame=Instance.new("Frame",TPPanel)
-tpBtnFrame.Size=UDim2.new(1,-20,0,32); tpBtnFrame.Position=UDim2.new(0,10,0,196)
-tpBtnFrame.BackgroundTransparency=1
-local tpBtnLay=Instance.new("UIListLayout",tpBtnFrame)
-tpBtnLay.FillDirection=Enum.FillDirection.Horizontal; tpBtnLay.Padding=UDim.new(0,6)
-
-local function mkTPBtn(lbl,clr,cb)
-    local b=Instance.new("TextButton",tpBtnFrame)
-    b.Size=UDim2.new(0.32,0,1,0); b.BackgroundColor3=clr
-    b.Text=lbl; b.TextColor3=Color3.new(1,1,1); b.Font=Enum.Font.GothamBold
-    b.TextSize=11; b.BorderSizePixel=0
-    Instance.new("UICorner",b).CornerRadius=UDim.new(0,5)
-    b.MouseButton1Click:Connect(cb)
-end
-mkTPBtn("💾 保存",Color3.fromRGB(30,80,160),function()
-    local hr=LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
-    if hr then table.insert(savedPositions,hr.Position); refreshTPList() end
-end)
-mkTPBtn("✈ テレポ",Color3.fromRGB(20,110,70),function()
-    if #savedPositions>0 then safeTeleport(savedPositions[#savedPositions]) end
-end)
-mkTPBtn("🗑 全削除",Color3.fromRGB(120,30,30),function()
-    savedPositions={}; refreshTPList()
-end)
-
-local tpHint=Instance.new("TextLabel",TPPanel)
-tpHint.Size=UDim2.new(1,-20,0,18); tpHint.Position=UDim2.new(0,10,0,236)
-tpHint.BackgroundTransparency=1
-tpHint.Text="右クリック → 個別削除  /  クリック → テレポート"
-tpHint.TextColor3=Color3.fromRGB(60,80,120); tpHint.Font=Enum.Font.Gotham
-tpHint.TextSize=10; tpHint.TextXAlignment=Enum.TextXAlignment.Left
-
-mkButton("▶  Teleport UI を開く / 閉じる",function()
-    TPPanel.Visible=not TPPanel.Visible
-end)
-
--- ============================================================
---  COMMAND BOX
--- ============================================================
-mkSpacer(6)
-mkSection("COMMAND")
-local cmdBox=Instance.new("TextBox",Content)
-cmdBox.Size=UDim2.new(1,0,0,30)
-cmdBox.BackgroundColor3=Color3.fromRGB(14,18,36); cmdBox.Text=""
-cmdBox.PlaceholderText="コマンド入力...  (fly / esp / follow ...)"
-cmdBox.PlaceholderColor3=Color3.fromRGB(60,80,120)
-cmdBox.TextColor3=C.textBright; cmdBox.Font=Enum.Font.Gotham; cmdBox.TextSize=12
-cmdBox.BorderSizePixel=0; cmdBox.ClearTextOnFocus=false
-Instance.new("UICorner",cmdBox).CornerRadius=UDim.new(0,6)
-Instance.new("UIStroke",cmdBox).Color=C.accent
-
-local COMMANDS={
-    "fly","noclip","infinityjump","esp","espHitbox","speedboost",
-    "rocket","recon","map","fixbody","optimization","parttransparent",
-    "walkingfly","teleport","follow","playerselect",
-    "posguard_on","posguard_off","reset"
-}
-local hintFrame=Instance.new("Frame",Content)
-hintFrame.Size=UDim2.new(1,0,0,0)
-hintFrame.BackgroundColor3=Color3.fromRGB(14,18,36)
-hintFrame.BorderSizePixel=0; hintFrame.ClipsDescendants=true
-hintFrame.Visible=false; hintFrame.ZIndex=20
-Instance.new("UICorner",hintFrame).CornerRadius=UDim.new(0,6)
-Instance.new("UIListLayout",hintFrame).Padding=UDim.new(0,0)
-
-local function updateHints(txt)
-    for _,c in ipairs(hintFrame:GetChildren()) do
-        if c:IsA("TextButton") then c:Destroy() end
-    end
-    if txt=="" then hintFrame.Visible=false; return end
-    local matches={}
-    for _,cmd in ipairs(COMMANDS) do
-        if cmd:find(txt:lower(),1,true) then table.insert(matches,cmd) end
-    end
-    if #matches==0 then hintFrame.Visible=false; return end
-    hintFrame.Visible=true
-    hintFrame.Size=UDim2.new(1,0,0,math.min(#matches,5)*24)
-    for _,m in ipairs(matches) do
-        local b=Instance.new("TextButton",hintFrame)
-        b.Size=UDim2.new(1,0,0,24); b.BackgroundColor3=Color3.fromRGB(18,24,48)
-        b.Text=m; b.TextColor3=C.accent; b.Font=Enum.Font.Gotham; b.TextSize=12
-        b.BorderSizePixel=0; b.ZIndex=21; b.TextXAlignment=Enum.TextXAlignment.Left
-        local p=Instance.new("UIPadding",b); p.PaddingLeft=UDim.new(0,8)
-        b.MouseButton1Click:Connect(function() cmdBox.Text=m; hintFrame.Visible=false end)
-    end
-end
-cmdBox:GetPropertyChangedSignal("Text"):Connect(function() updateHints(cmdBox.Text) end)
-
-local cmdMap={
-    fly="fly", noclip="noclip", infinityjump="infinityJump", esp="esp",
-    espHitbox="espHitbox", speedboost="speedBoost", rocket="rocket",
-    recon="recon", map="map", fixbody="fixBody", optimization="optimization",
-    parttransparent="partTransparent", walkingfly="walkingFly"
-}
-cmdBox.FocusLost:Connect(function(enter)
-    if not enter then return end
-    local cmd=cmdBox.Text:lower():gsub("%s","")
-    if cmd=="posguard_on" then guardActive=false; startPositionGuard()
-    elseif cmd=="posguard_off" then guardActive=false
-    elseif cmd=="teleport" then TPPanel.Visible=true
-    elseif cmd=="playerselect" then PlrPanel.Visible=true; refreshPlayerList()
-    elseif cmd=="follow" then
-        if State.selectedPlayer then
-            State.follow=not State.follow
-            followTrack.BackgroundColor3=State.follow and C.orange or C.toggleOff
-            followThumb.Position=State.follow and UDim2.new(0,21,0.5,-7) or UDim2.new(0,3,0.5,-7)
-        end
-    elseif cmd=="reset" then
-        if LP.Character then LP.Character:BreakJoints() end
-    elseif cmdMap[cmd] then
-        State[cmdMap[cmd]]=not State[cmdMap[cmd]]
-    end
-    cmdBox.Text=""; hintFrame.Visible=false
-end)
-mkSpacer(8)
-
--- ============================================================
---  MAIN RENDER LOOP
--- ============================================================
-
--- ESPヒットボックス管理テーブル
-local hitboxBoxes = {}   -- [player] = SelectionBox
-
-RunService.RenderStepped:Connect(function(dt)
-    local chr=LP.Character; if not chr then return end
-    local hr =chr:FindFirstChild("HumanoidRootPart")
-    local hum=chr:FindFirstChildWhichIsA("Humanoid")
-    if not hr or not hum then return end
-
-    -- ── FLY ─────────────────────────────────────────────────
-    if State.fly then
-        local bp=hr:FindFirstChild("FlyBP")
-        local bg=hr:FindFirstChild("FlyBG")
-        if not bp then
-            bp=Instance.new("BodyPosition"); bp.Name="FlyBP"
-            bp.MaxForce=Vector3.new(math.huge,math.huge,math.huge)
-            bp.P=1e5; bp.D=500; bp.Position=hr.Position; bp.Parent=hr
-        end
-        if not bg then
-            bg=Instance.new("BodyGyro"); bg.Name="FlyBG"
-            bg.MaxTorque=Vector3.new(math.huge,math.huge,math.huge)
-            bg.P=1e4; bg.Parent=hr
-        end
-        local dir=Vector3.zero
-        if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir+=Camera.CFrame.LookVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir-=Camera.CFrame.LookVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir-=Camera.CFrame.RightVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir+=Camera.CFrame.RightVector end
-        if UserInputService:IsKeyDown(Enum.KeyCode.Space)       then dir+=Vector3.yAxis end
-        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then dir-=Vector3.yAxis end
-        if dir.Magnitude>0 then dir=dir.Unit end
-        bp.Position=bp.Position+dir*State.flySpeed*dt
-        bg.CFrame=Camera.CFrame
-        hum.PlatformStand=true
-    else
-        for _,n in ipairs({"FlyBP","FlyBG"}) do
-            local m=hr:FindFirstChild(n); if m then m:Destroy() end
-        end
-        if hum.PlatformStand and not State.walkingFly then hum.PlatformStand=false end
-    end
-
-    -- ── WALKING FLY ─────────────────────────────────────────
-    if State.walkingFly and not State.fly then
-        local wbp=hr:FindFirstChild("WalkFlyBP") or Instance.new("BodyPosition")
-        wbp.Name="WalkFlyBP"; wbp.MaxForce=Vector3.new(0,math.huge,0)
-        wbp.P=1e5; wbp.Position=Vector3.new(hr.Position.X,hr.Position.Y+3,hr.Position.Z)
-        wbp.Parent=hr; hum.WalkSpeed=State.walkingFlySpeed
-    else
-        local w=hr:FindFirstChild("WalkFlyBP"); if w then w:Destroy() end
-    end
-
-    -- ── NOCLIP ──────────────────────────────────────────────
-    if State.noclip then
-        for _,p in ipairs(chr:GetDescendants()) do
-            if p:IsA("BasePart") then p.CanCollide=false end
-        end
-    end
-
-    -- ── ANTI KNOCKBACK ───────────────────────────────────────
-    if State.antiKnockback then
-        pcall(function() applyAntiKnockback(hr) end)
-    end
-
-    -- ── FIX BODY ────────────────────────────────────────────
-    if State.fixBody then
-        for _,p in ipairs(chr:GetDescendants()) do
-            if p:IsA("BasePart") and p.Name~="HumanoidRootPart" then
-                p.LocalTransparencyModifier=1
-            end
-        end
-    end
-
-    -- ── ESP + HITBOX ─────────────────────────────────────────
-    for _,plr in ipairs(Players:GetPlayers()) do
-        if plr==LP then continue end
-        local pChr=plr.Character
-        local ehr=pChr and pChr:FindFirstChild("HumanoidRootPart")
-
-        -- ESP 名前タグ
-        if State.esp and ehr then
-            local dist=(hr.Position-ehr.Position).Magnitude
-            local tag=ehr:FindFirstChild("ESP_BB")
-            if dist>=90 and dist<=250 then
-                if not tag then
-                    local bb=Instance.new("BillboardGui"); bb.Name="ESP_BB"
-                    bb.Size=UDim2.new(0,90,0,22); bb.StudsOffset=Vector3.new(0,4,0)
-                    bb.AlwaysOnTop=true; bb.Parent=ehr
-                    local tl=Instance.new("TextLabel",bb)
-                    tl.Size=UDim2.new(1,0,1,0); tl.BackgroundTransparency=1
-                    tl.TextColor3=Color3.fromRGB(255,60,60)
-                    tl.Font=Enum.Font.GothamBold; tl.TextSize=12
-                end
-                local tl=ehr.ESP_BB:FindFirstChildWhichIsA("TextLabel")
-                if tl then tl.Text=plr.Name.." ["..math.floor(dist).."m]" end
-            else
-                if tag then tag:Destroy() end
-            end
-        else
-            if ehr then
-                local tag=ehr:FindFirstChild("ESP_BB")
-                if tag then tag:Destroy() end
-            end
-        end
-
-        -- ESP HITBOX (SelectionBox)
-        if State.espHitbox and pChr and ehr then
-            local dist=(hr.Position-ehr.Position).Magnitude
-            if dist<=300 then
-                if not hitboxBoxes[plr] then
-                    local sb=Instance.new("SelectionBox")
-                    sb.Name="ESPHitbox"
-                    sb.Color3=Color3.fromRGB(255,50,50)
-                    sb.SurfaceColor3=Color3.fromRGB(255,50,50)
-                    sb.SurfaceTransparency=0.85
-                    sb.LineThickness=0.04
-                    sb.Adornee=pChr
-                    sb.Parent=Workspace
-                    hitboxBoxes[plr]=sb
-                end
-            else
-                if hitboxBoxes[plr] then
-                    hitboxBoxes[plr]:Destroy(); hitboxBoxes[plr]=nil
-                end
-            end
-        else
-            -- ESPHitbox OFF なら全削除
-            if hitboxBoxes[plr] then
-                hitboxBoxes[plr]:Destroy(); hitboxBoxes[plr]=nil
-            end
-        end
-    end
-
-    -- ── FOLLOW (追跡) ────────────────────────────────────────
-    if State.follow and State.selectedPlayer then
-        local tChr=State.selectedPlayer.Character
-        local thr =tChr and tChr:FindFirstChild("HumanoidRootPart")
-        if thr then
-            -- 対象の後ろ5スタッドに配置
-            local behindPos = thr.CFrame * CFrame.new(0,0,5)
-            local fp=hr:FindFirstChild("FollowBP") or Instance.new("BodyPosition")
-            fp.Name="FollowBP"
-            fp.MaxForce=Vector3.new(math.huge,math.huge,math.huge)
-            fp.P=3e4; fp.D=800
-            fp.Position=behindPos.Position
-            fp.Parent=hr
-            -- 同じ方向を向く
-            local bg2=hr:FindFirstChild("FollowBG") or Instance.new("BodyGyro")
-            bg2.Name="FollowBG"
-            bg2.MaxTorque=Vector3.new(math.huge,math.huge,math.huge)
-            bg2.P=5000
-            bg2.CFrame=thr.CFrame; bg2.Parent=hr
-            hum.PlatformStand=true
-        end
-    else
-        for _,n in ipairs({"FollowBP","FollowBG"}) do
-            local m=hr:FindFirstChild(n); if m then m:Destroy() end
-        end
-        if not State.fly and hum.PlatformStand then hum.PlatformStand=false end
-    end
-
-    -- ── WalkSpeed 常時保護 (毎フレームではなくずれ検知時のみ) ──
-    -- guardHumanoidStats でイベント監視しているのでここでは不要
-end)
-
--- ============================================================
---  キーボード
--- ============================================================
-UserInputService.JumpRequest:Connect(function()
-    if not State.infinityJump then return end
-    local hum=LP.Character and LP.Character:FindFirstChildWhichIsA("Humanoid")
-    if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
-end)
-
-UserInputService.InputBegan:Connect(function(inp,gpe)
-    if gpe then return end
-
-    -- Rocket [P]
-    if inp.KeyCode==Enum.KeyCode.P and State.rocket then
-        local hr=LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
-        if hr then
-            local exp=Instance.new("Explosion"); exp.Position=hr.Position
-            exp.BlastRadius=0; exp.BlastPressure=0; exp.Parent=Workspace
-            task.delay(0.5,function() pcall(function() exp:Destroy() end) end)
-            local bv=Instance.new("BodyVelocity")
-            bv.Velocity=Vector3.new(0,220,0)
-            bv.MaxForce=Vector3.new(0,math.huge,0); bv.Parent=hr
-            task.delay(0.35,function() pcall(function() bv:Destroy() end) end)
-        end
-    end
-
-    -- Recon [E]
-    if inp.KeyCode==Enum.KeyCode.E and State.recon then
-        local chr=LP.Character
-        local hr=chr and chr:FindFirstChild("HumanoidRootPart")
-        if not hr then return end
-        local rp=RaycastParams.new()
-        rp.FilterDescendantsInstances={chr}; rp.FilterType=Enum.RaycastFilterType.Exclude
-        local res=Workspace:Raycast(hr.Position,Camera.CFrame.LookVector*4,rp)
-        local tgt=res and (res.Position+res.Normal*2) or (hr.Position+Camera.CFrame.LookVector)
-        hr.CFrame=CFrame.new(tgt); hr.Velocity=Vector3.zero
-        task.delay(3,function()
-            for _,plr in ipairs(Players:GetPlayers()) do
-                if plr~=LP and plr.Character then
-                    local ehr=plr.Character:FindFirstChild("HumanoidRootPart")
-                    if ehr and (hr.Position-ehr.Position).Magnitude<=250 then
-                        local sb=Instance.new("SelectionBox")
-                        sb.Color3=Color3.fromRGB(255,0,0); sb.LineThickness=0.06
-                        sb.Adornee=plr.Character; sb.Parent=Workspace
-                        task.delay(5,function() pcall(function() sb:Destroy() end) end)
-                    end
-                end
-            end
-        end)
-    end
-
-    -- Follow [J]  ─ トグル
-    if inp.KeyCode==Enum.KeyCode.J then
-        if not State.selectedPlayer then
-            -- 選択なしのとき警告
-            local warn=Instance.new("TextLabel",ScreenGui)
-            warn.Size=UDim2.new(0,280,0,36)
-            warn.Position=UDim2.new(0.5,-140,0,10)
-            warn.BackgroundColor3=Color3.fromRGB(80,20,20)
-            warn.Text="⚠  プレイヤーを先に選択してください"
-            warn.TextColor3=Color3.fromRGB(255,100,100)
-            warn.Font=Enum.Font.GothamBold; warn.TextSize=12
-            warn.BorderSizePixel=0
-            Instance.new("UICorner",warn).CornerRadius=UDim.new(0,8)
-            task.delay(2,function() pcall(function() warn:Destroy() end) end)
-            return
-        end
-        State.follow=not State.follow
-        followTrack.BackgroundColor3=State.follow and C.orange or C.toggleOff
-        TweenService:Create(followThumb,TweenInfo.new(0.15),{
-            Position=State.follow and UDim2.new(0,21,0.5,-7) or UDim2.new(0,3,0.5,-7)
-        }):Play()
-
-        -- Follow ON → 追跡中は位置ガード無効化
-        if State.follow then
-            guardActive=false  -- 追跡中は位置ガード停止（自分が動くため）
-        else
-            -- Follow OFF → 位置ガード再開
-            local hr=LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
-            if hr then guardedPos=hr.Position end
-            guardActive=false; startPositionGuard()
-        end
-    end
-
-    -- Show / Hide [右Ctrl]
-    if inp.KeyCode==Enum.KeyCode.RightControl then
-        MainFrame.Visible=not MainFrame.Visible
-    end
-
-    -- Block Remote Teleport [4キー]
-    if inp.KeyCode==Enum.KeyCode.Four then
-        State.blockRemoteTeleport = not State.blockRemoteTeleport
-        -- 画面に通知トースト
-        local toast=Instance.new("TextLabel",ScreenGui)
-        toast.Size=UDim2.new(0,300,0,36)
-        toast.Position=UDim2.new(0.5,-150,0,10)
-        toast.BackgroundColor3=State.blockRemoteTeleport
-            and Color3.fromRGB(20,80,30)
-            or  Color3.fromRGB(60,30,20)
-        toast.Text=State.blockRemoteTeleport
-            and "🔒 Remote Teleport ブロック ON"
-            or  "🔓 Remote Teleport ブロック OFF"
-        toast.TextColor3=State.blockRemoteTeleport
-            and Color3.fromRGB(100,255,130)
-            or  Color3.fromRGB(255,160,80)
-        toast.Font=Enum.Font.GothamBold; toast.TextSize=13
-        toast.BorderSizePixel=0
-        Instance.new("UICorner",toast).CornerRadius=UDim.new(0,8)
-        -- フェードアウト
-        task.delay(1.5,function()
-            TweenService:Create(toast,TweenInfo.new(0.5),{TextTransparency=1,BackgroundTransparency=1}):Play()
-            task.delay(0.5,function() pcall(function() toast:Destroy() end) end)
-        end)
-    end
-end)
-
--- ============================================================
---  キャラクターリスポーン
--- ============================================================
-local function onCharAdded(chr)
-    local hr =chr:WaitForChild("HumanoidRootPart",10)
-    local hum=chr:WaitForChild("Humanoid",10)
-    if not hr or not hum then return end
-    hum.WalkSpeed=State.walkSpeed; hum.JumpPower=State.jumpPower
-    guardHumanoidStats(hum)  -- WalkSpeed/JumpPower/Sit/PlatformStand/Ragdoll監視も内包
-    claimOwnership()
-    if State.fixBody then
-        for _,p in ipairs(chr:GetDescendants()) do
-            if p:IsA("BasePart") and p.Name~="HumanoidRootPart" then
-                p.LocalTransparencyModifier=1
-            end
-        end
-    end
-    task.delay(1.2,function()
-        guardedPos=hr.Position; guardActive=false; startPositionGuard()
-    end)
-end
-LP.CharacterAdded:Connect(onCharAdded)
-if LP.Character then task.spawn(function() onCharAdded(LP.Character) end) end
-
--- ヒントラベル
-local hintLbl=Instance.new("TextLabel",ScreenGui)
-hintLbl.Size=UDim2.new(0,400,0,18); hintLbl.Position=UDim2.new(0,40,1,-26)
-hintLbl.BackgroundTransparency=1
-hintLbl.Text="[右Ctrl] 表示切替  |  [P] Rocket  |  [E] Recon  |  [J] Follow"
-hintLbl.TextColor3=Color3.fromRGB(50,90,150)
-hintLbl.Font=Enum.Font.Gotham; hintLbl.TextSize=11
-hintLbl.TextXAlignment=Enum.TextXAlignment.Left
-
-print("[auto mod v1 v3.2] ✓ 読込完了  |  右Ctrl:表示  4:RemoteTPブロック切替")
+ほほ ============================================================
+ほほ   ちなから もらし ひぬ  ひあ  ー  自分k:@|] め とかなしにら専用
+ほほ   追加け ぃとせvZs-@Zhr め 2[;e7|選択なに め 追跡ゅまょ め ちそ強化
+ほほ ============================================================
+
+りらそちり せりちんいすと          = きちもいけきいかといすひにそいゅ"せりちんいすと"ょ
+りらそちり すなみといすひにそい       = きちもいけきいかといすひにそいゅ"すなみといすひにそい"ょ
+りらそちり なといすにみせなかといすひにそい = きちもいけきいかといすひにそいゅ"なといすにみせなかといすひにそい"ょ
+りらそちり かていいみといすひにそい     = きちもいけきいかといすひにそいゅ"かていいみといすひにそい"ょ
+りらそちり てらすのとせちそい        = きちもいけきいかといすひにそいゅ"てらすのとせちそい"ょ
+りらそちり りにきくかにみき         = きちもいけきいかといすひにそいゅ"りにきくかにみき"ょ
+りらそちり そらすいきなに          = きちもいけきいかといすひにそいゅ"そらすいきなに"ょ
+りらそちり すいせりにそちかいしとからすちきい= きちもいけきいかといすひにそいゅ"すいせりにそちかいしとからすちきい"ょ
+りらそちり そちもいすち           = てらすのとせちそいるそなすすいみかそちもいすち
+
+りらそちり りせ   = せりちんいすとるりらそちりせりちんいす
+りらそちり もらなとい= りせけきいかもらなといゅょ
+
+ほほ 既存きなに削除
+せそちりりゅはなみそかにらみゅょ
+    りらそちり らりし = そらすいきなにけはにみしはにすとかそくにりしゅ"ちなからもらしひぬ"ょ
+    には らりし かくいみ らりしけしいとかすらんゅょ いみし
+いみしょ
+
+ほほ ============================================================
+ほほ  とかちかぃ
+ほほ ============================================================
+りらそちり とかちかい = 「
+    はりん             = はちりといね
+    はりんとせいいし        = えわね
+    てちりのにみきはりん      = はちりといね
+    てちりのにみきはりんとせいいし = あわね
+    みらそりにせ          = はちりといね
+    にみはにみにかんまなもせ    = はちりといね
+    いとせ             = はちりといね
+    いとせくにかこらさ       = はちりといね
+    とせいいしこららとか      = はちりといね
+    すらそのいか          = はちりといね
+    すいそらみ           = はちりといね
+    もちせ             = はちりといね
+    はにさこらしん         = はちりといね
+    らせかにもにつちかにらみ    = はちりといね
+    せちすかかすちみとせちすいみか = はちりといね
+    てちりのとせいいし       = ぬおね
+    まなもせせらていす       = えわね
+    はらりりらて          = はちりといね      ほほ 追跡m|s@
+    といりいそかいしせりちんいす  = みにりね        ほほ 選択中kせりちんいす
+    ちみかにのみらそのこちその      = はちりといね    ほほ 吹Z飛v@無効化
+    ちみかにすちきしらりり        = はちりといね    ほほ oh@s@|.無効化
+    こりらそのすいもらかいかいりいせらすか= はちりといね    ほほ :@|]内w;-[|s2@\Zh ゅうg|ょ
+」
+
+ほほ ============================================================
+ほほ  ██  ちみかにほそくぃちか くちすしぃみにみき ゅ強化版ょ  ██
+ほほ ============================================================
+
+ほほ ゜ちそほぬむ とにもなりちかにらみすちしになと 最大維持
+かちとのるとせちてみゅはなみそかにらみゅょ
+    てくにりい かちとのるてちにかゅわるあえょ しら
+        せそちりりゅはなみそかにらみゅょ
+            りせるとにもなりちかにらみすちしになと        = もちかくるくなきい
+            りせるもちさにもなもとにもなりちかにらみすちしになと = もちかくるくなきい
+        いみしょ
+    いみし
+いみしょ
+
+ほほ ゜ちそほふむ すいせりにそちかにらみはらそなと 固定
+かちとのるとせちてみゅはなみそかにらみゅょ
+    てくにりい かちとのるてちにかゅわるふえょ しら
+        せそちりりゅはなみそかにらみゅょ
+            りらそちり くす = りせるそくちすちそかいす ちみし りせるそくちすちそかいすけはにみしはにすとかそくにりしゅ"くなもちみらにしすららかせちすか"ょ
+            りせるすいせりにそちかにらみはらそなと = くす らす てらすのとせちそい
+        いみしょ
+    いみし
+いみしょ
+
+ほほ ゜ちそほあむ みいかてらすのらてみいすとくにせ 定期取得
+りらそちり はなみそかにらみ そりちにもらてみいすとくにせゅょ
+    せそちりりゅはなみそかにらみゅょ
+        りらそちり そくす = りせるそくちすちそかいすれ には みらか そくす かくいみ すいかなすみ いみし
+        はらす _ね せ にみ にせちにすとゅそくすけきいかしいとそいみしちみかとゅょょ しら
+            には せけにとちゅ"こちといせちすか"ょ かくいみ
+                せそちりりゅはなみそかにらみゅょ せけといかみいかてらすのらてみいすゅりせょ いみしょ
+            いみし
+        いみし
+    いみしょ
+いみし
+かちとのるとせちてみゅはなみそかにらみゅょ てくにりい かちとのるてちにかゅわるゆょ しら そりちにもらてみいすとくにせゅょ いみし いみしょ
+
+ほほ ゜ちそほうむ てちりのとせいいし 引g戻d対策
+ほほ   くなもちみらにしるてちりのとせいいし を外部to書g換5o;qo即座i戻r
+りらそちり はなみそかにらみ きなちすしくなもちみらにしとかちかとゅくなもょ
+    には みらか くなも かくいみ すいかなすみ いみし
+    せそちりりゅはなみそかにらみゅょ
+        ほほ てちりのとせいいし 監視
+        くなもけきいかせすらせいすかんそくちみきいしとにきみちりゅ"てちりのとせいいし"ょけそらみみいそかゅはなみそかにらみゅょ
+            りらそちり いさせいそかいし = とかちかいるとせいいしこららとか ちみし ゅとかちかいるてちりのとせいいし+あわょ らす とかちかいるてちりのとせいいし
+            には もちかくるちことゅくなもるてちりのとせいいし ほ いさせいそかいしょ 。 わるえ かくいみ
+                かちとのるてちにかゅょ
+                せそちりりゅはなみそかにらみゅょ くなもるてちりのとせいいし = いさせいそかいし いみしょ
+            いみし
+        いみしょ
+        ほほ まなもせせらていす 監視
+        くなもけきいかせすらせいすかんそくちみきいしとにきみちりゅ"まなもせせらていす"ょけそらみみいそかゅはなみそかにらみゅょ
+            には もちかくるちことゅくなもるまなもせせらていす ほ とかちかいるまなもせせらていすょ 。 わるえ かくいみ
+                かちとのるてちにかゅょ
+                せそちりりゅはなみそかにらみゅょ くなもるまなもせせらていす = とかちかいるまなもせせらていす いみしょ
+            いみし
+        いみしょ
+        ほほ とにか 強制解除
+        くなもけきいかせすらせいすかんそくちみきいしとにきみちりゅ"とにか"ょけそらみみいそかゅはなみそかにらみゅょ
+            には くなもるとにか かくいみ かちとのるてちにかゅょれ せそちりりゅはなみそかにらみゅょ くなもるとにか = はちりとい いみしょ いみし
+        いみしょ
+        ほほ せりちかはらすもとかちみし 監視（はりん以外w@f解除）
+        くなもけきいかせすらせいすかんそくちみきいしとにきみちりゅ"せりちかはらすもとかちみし"ょけそらみみいそかゅはなみそかにらみゅょ
+            には みらか とかちかいるはりん ちみし くなもるせりちかはらすもとかちみし かくいみ
+                かちとのるてちにかゅょれ せそちりりゅはなみそかにらみゅょ くなもるせりちかはらすもとかちみし = はちりとい いみしょ
+            いみし
+        いみしょ
+
+        ほほ oh@s@|.無効け くなもちみらにしとかちかいかんせいるすちきしらりり め はちりりにみきしらてみ を即座ig'yp.
+        くなもるとかちかいそくちみきいしけそらみみいそかゅはなみそかにらみゅ_ね みいてょ
+            には とかちかいるちみかにすちきしらりり かくいみ
+                には みいて == ぃみなもるくなもちみらにしとかちかいかんせいるすちきしらりり
+                らす みいて == ぃみなもるくなもちみらにしとかちかいかんせいるはちりりにみきしらてみ かくいみ
+                    かちとのるてちにかゅょ
+                    せそちりりゅはなみそかにらみゅょ
+                        くなもけそくちみきいとかちかいゅぃみなもるくなもちみらにしとかちかいかんせいるきいかかにみきなせょ
+                    いみしょ
+                いみし
+            いみし
+        いみしょ
+    いみしょ
+いみし
+
+ほほ 吹Z飛v@無効け くなもちみらにしすららかせちすか k ひいりらそにかん を毎2;|]監視dwg'yp.
+ほほ ゅすいみしいすとかいせせいし.|2[内w@処理r.q/関数化ょ
+りらそちり はなみそかにらみ ちせせりんちみかにのみらそのこちそのゅくすょ
+    ほほ ひいりらそにかん t@大grg@.sg水平方向をp@\i戻r
+    りらそちり ひいり = くするちとといもこりんりにみいちすひいりらそにかん
+    ほほ 垂直（ん）f はりんめすらそのいかめまなもせ w@使4kw@水平kn制限
+    りらそちり くらすにつとせいいし = ひいそからすふるみいてゅひいりるさね ひいりるっょるもちきみにかなしい
+    には くらすにつとせいいし 。 おわ かくいみ
+        くするちとといもこりんりにみいちすひいりらそにかん = ひいそからすあるみいてゅわね ひいりるんね わょ
+    いみし
+いみし
+
+ほほ ゜ちそほえむ 位置監視t@|s@
+りらそちり きなちすしいしせらと  = みにり
+りらそちり きなちすしちそかにひい = はちりとい
+りらそちり きなちすしせちなといし = はちりとい
+
+りらそちり はなみそかにらみ とかちすかせらとにかにらみきなちすしゅょ
+    には きなちすしちそかにひい かくいみ すいかなすみ いみし
+    きなちすしちそかにひい = かすない
+    かちとのるとせちてみゅはなみそかにらみゅょ
+        てくにりい きなちすしちそかにひい しら
+            かちとのるてちにかゅわるわえょ
+            には きなちすしせちなといし かくいみ そらみかにみない いみし
+            りらそちり そくす = りせるそくちすちそかいす
+            りらそちり くす  = そくす ちみし そくすけはにみしはにすとかそくにりしゅ"くなもちみらにしすららかせちすか"ょ
+            には くす ちみし きなちすしいしせらと かくいみ
+                りらそちり しいりかち = ゅくするせらとにかにらみ ほ きなちすしいしせらとょるもちきみにかなしい
+                ほほ 追跡中f大gh動hkw@判定を緩/.
+                りらそちり かくすいとくらりし = とかちかいるはらりりらて ちみし よよよ らす おわ
+                には しいりかち 。 かくすいとくらりし かくいみ
+                    せそちりりゅはなみそかにらみゅょ
+                        くするそはすちもい      = そはすちもいるみいてゅきなちすしいしせらとょ
+                        くするひいりらそにかん    = ひいそからすあるついすら
+                        くするすらかひいりらそにかん = ひいそからすあるついすら
+                    いみしょ
+                いみし
+            いみし
+            には くす かくいみ きなちすしいしせらと = くするせらとにかにらみ いみし
+        いみし
+    いみしょ
+いみし
+
+ほほ ゜ちそほおむ すいもらかいぃひいみか 2Zh（位置lpZs系を2@\Zh）
+ほほ   とかちかいるこりらそのすいもらかいかいりいせらすか t@ かすない ksgq@:無視r.
+りらそちり はなみそかにらみ くららのすいもらかいとゅょ
+    せそちりりゅはなみそかにらみゅょ
+        はらす _ね ひ にみ にせちにすとゅすいせりにそちかいしとからすちきいけきいかしいとそいみしちみかとゅょょ しら
+            には ひけにとちゅ"すいもらかいぃひいみか"ょ かくいみ
+                せそちりりゅはなみそかにらみゅょ
+                    ひるらみそりにいみかぃひいみかけそらみみいそかゅはなみそかにらみゅるるるょ
+                        ほほ こりらそのすいもらかいかいりいせらすか らみ ksgq@:何mdue
+                        ほほ らはは ksgf通常通l:@|]側k処理t@動h
+                        ほほ ※bbw@f{追加lru|}sdw登録r.q@:ukw@
+                        ほほ   :@|]本来k処理f別kそらみみいそかw@動g続:.
+                        には とかちかいるこりらそのすいもらかいかいりいせらすか かくいみ すいかなすみ いみし
+                    いみしょ
+                いみしょ
+            いみし
+        いみし
+    いみしょ
+    すいせりにそちかいしとからすちきいるしいとそいみしちみかちししいしけそらみみいそかゅはなみそかにらみゅひょ
+        には ひけにとちゅ"すいもらかいぃひいみか"ょ かくいみ
+            せそちりりゅはなみそかにらみゅょ
+                ひるらみそりにいみかぃひいみかけそらみみいそかゅはなみそかにらみゅるるるょ
+                    には とかちかいるこりらそのすいもらかいかいりいせらすか かくいみ すいかなすみ いみし
+                いみしょ
+            いみしょ
+        いみし
+    いみしょ
+いみし
+かちとのるとせちてみゅくららのすいもらかいとょ
+
+ほほ ============================================================
+ほほ  とちはぃ かぃりぃせらすか
+ほほ ============================================================
+りらそちり はなみそかにらみ とちはいかいりいせらすかゅかちすきいかせらとょ
+    りらそちり そくす = りせるそくちすちそかいす
+    りらそちり くす  = そくす ちみし そくすけはにみしはにすとかそくにりしゅ"くなもちみらにしすららかせちすか"ょ
+    には みらか くす かくいみ すいかなすみ いみし
+    りらそちり くなも = そくすけはにみしはにすとかそくにりしてくにそくにとちゅ"くなもちみらにし"ょ
+
+    きなちすしせちなといし = かすない
+
+    ほほ 干渉r. こらしんもらひいす を一時削除
+    はらす _ね みちもい にみ にせちにすとゅ「"はりんこせ"ね"はりんこき"ね"てちりのはりんこせ"ね"かせこせ"ね"はらりりらてこせ"」ょ しら
+        りらそちり も = くすけはにみしはにすとかそくにりしゅみちもいょれ には も かくいみ もけしいとかすらんゅょ いみし
+    いみし
+    には くなも かくいみ くなもるせりちかはらすもとかちみし = はちりとい いみし
+
+    りらそちり しいとか = かちすきいかせらと + ひいそからすあるみいてゅわね あね わょ
+    りらそちり こせ = にみとかちみそいるみいてゅ"こらしんせらとにかにらみ"ょ
+    こせるみちもい = "かせこせ"れ こせるもちさはらすそい = ひいそからすあるみいてゅもちかくるくなきいねもちかくるくなきいねもちかくるくなきいょ
+    こせるせ = ふいおれ こせるし = ふわわわれ こせるせらとにかにらみ = しいとかれ こせるせちすいみか = くす
+
+    かちとのるとせちてみゅはなみそかにらみゅょ
+        はらす に = ぬね ぬわ しら
+            かちとのるてちにかゅょ
+            せそちりりゅはなみそかにらみゅょ
+                くするそはすちもい = そはすちもいるみいてゅしいとかょ
+                くするひいりらそにかん = ひいそからすあるついすられ くするすらかひいりらそにかん = ひいそからすあるついすら
+            いみしょ
+        いみし
+        かちとのるてちにかゅわるあょ
+        せそちりりゅはなみそかにらみゅょ こせけしいとかすらんゅょ いみしょ
+
+        ほほ はりん再3qZa
+        には とかちかいるはりん かくいみ
+            りらそちり みいてこせ = にみとかちみそいるみいてゅ"こらしんせらとにかにらみ"ょれ みいてこせるみちもい="はりんこせ"
+            みいてこせるもちさはらすそい=ひいそからすあるみいてゅもちかくるくなきいねもちかくるくなきいねもちかくるくなきいょ
+            みいてこせるせ=ぬいえれ みいてこせるし=えわわれ みいてこせるせらとにかにらみ=しいとかれ みいてこせるせちすいみか=くす
+            りらそちり みいてこき = にみとかちみそいるみいてゅ"こらしんきんすら"ょれ みいてこきるみちもい="はりんこき"
+            みいてこきるもちさからすたない=ひいそからすあるみいてゅもちかくるくなきいねもちかくるくなきいねもちかくるくなきいょ
+            みいてこきるせ=ぬいうれ みいてこきるせちすいみか=くす
+            には くなも かくいみ くなもるせりちかはらすもとかちみし=かすない いみし
+        いみし
+
+        きなちすしいしせらと  = しいとか
+        きなちすしせちなといし = はちりとい
+    いみしょ
+いみし
+
+ほほ ============================================================
+ほほ  きなに to|定義
+ほほ ============================================================
+りらそちり そ = 「
+    こき        = そらりらすあるはすらもすきこゅぬわね  ぬふね  ふふょね
+    ちそそいみか    = そらりらすあるはすらもすきこゅやうね ぬえゆね ふええょね
+    ちそそいみかしにも = そらりらすあるはすらもすきこゅあわね  やわね ぬあわょね
+    かいさか      = そらりらすあるはすらもすきこゅぬやおね ぬよおね ふあふょね
+    かいさかこすにきくか= そらりらすあるはすらもすきこゅふふわね ふあえね ふええょね
+    といせ       = そらりらすあるはすらもすきこゅあわね  うわね  やわょね
+    からききりいらはは = そらりらすあるはすらもすきこゅうわね  うえね  やわょね
+    からききりいらみ  = そらりらすあるはすらもすきこゅやうね ぬえゆね ふええょね
+    すいし       = そらりらすあるはすらもすきこゅふええね ゆわね  ゆわょね
+    きすいいみ     = そらりらすあるはすらもすきこゅゆわね ふふわね ぬふわょね
+    らすちみきい    = そらりらすあるはすらもすきこゅふええね ぬおわね  えわょね
+」
+
+ほほ ============================================================
+ほほ  とそすぃぃみ きなに
+ほほ ============================================================
+りらそちり とそすいいみきなに = にみとかちみそいるみいてゅ"とそすいいみきなに"ょ
+とそすいいみきなにるみちもい="ちなからもらしひぬ"れ とそすいいみきなにるすいといからみとせちてみ=はちりとい
+とそすいいみきなにるっにみしいさこいくちひにらす=ぃみなもるっにみしいさこいくちひにらするとにこりにみき
+とそすいいみきなにるせちすいみか=そらすいきなに
+
+ほほ もちにみ はすちもい
+りらそちり もちにみはすちもい = にみとかちみそいるみいてゅ"はすちもい"ょ
+もちにみはすちもいるとについ=なしにもふるみいてゅわねうおわねわねおうわょ
+もちにみはすちもいるせらとにかにらみ=なしにもふるみいてゅわねうわねわねうわょ
+もちにみはすちもいるこちそのきすらなみしそらりらすあ=そるこきれ もちにみはすちもいるこらすしいすとについせにさいり=わ
+もちにみはすちもいるちそかにひい=かすないれ もちにみはすちもいるしすちききちこりい=かすないれ もちにみはすちもいるせちすいみか=とそすいいみきなに
+にみとかちみそいるみいてゅ"なにそらすみいす"ねもちにみはすちもいょるそらすみいすすちしになと=なしにもるみいてゅわねぬふょ
+りらそちり もとかすらのい=にみとかちみそいるみいてゅ"なにとかすらのい"ねもちにみはすちもいょ
+もとかすらのいるそらりらす=そらりらすあるはすらもすきこゅおわねぬふわねふふわょれ もとかすらのいるかくにそのみいとと=ぬ
+
+ほほ かにかりい こちす
+りらそちり かにかりいこちす=にみとかちみそいるみいてゅ"はすちもい"ょ
+かにかりいこちするとについ=なしにもふるみいてゅぬねわねわねあおょ
+かにかりいこちするこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅぬふねふわねうえょ
+かにかりいこちするこらすしいすとについせにさいり=われ かにかりいこちするせちすいみか=もちにみはすちもい
+にみとかちみそいるみいてゅ"なにそらすみいす"ねかにかりいこちすょるそらすみいすすちしになと=なしにもるみいてゅわねぬふょ
+
+りらそちり かにかりいりこり=にみとかちみそいるみいてゅ"かいさかりちこいり"ねかにかりいこちすょ
+かにかりいりこりるとについ=なしにもふるみいてゅぬねほよわねぬねわょれ かにかりいりこりるせらとにかにらみ=なしにもふるみいてゅわねぬうねわねわょ
+かにかりいりこりるこちそのきすらなみしかすちみとせちすいみそん=ぬれ かにかりいりこりるかいさか="◈  ちなから もらし  ひぬ"
+かにかりいりこりるかいさかそらりらすあ=そるちそそいみかれ かにかりいりこりるはらみか=ぃみなもるはらみかるきらかくちもこらりし
+かにかりいりこりるかいさかとについ=ぬうれ かにかりいりこりるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+
+りらそちり しらか=にみとかちみそいるみいてゅ"はすちもい"ねかにかりいこちすょ
+しらかるとについ=なしにもふるみいてゅわねゆねわねゆょれ しらかるせらとにかにらみ=なしにもふるみいてゅぬねほようねわるえねほうょ
+しらかるこちそのきすらなみしそらりらすあ=そるきすいいみれ しらかるこらすしいすとについせにさいり=わ
+にみとかちみそいるみいてゅ"なにそらすみいす"ねしらかょるそらすみいすすちしになと=なしにもるみいてゅぬねわょ
+
+りらそちり はなみそかにらみ ものかにかりいこかみゅさねこきねかさかねそりすょ
+    りらそちり こ=にみとかちみそいるみいてゅ"かいさかこなかからみ"ねかにかりいこちすょ
+    こるとについ=なしにもふるみいてゅわねふゆねわねふゆょれ こるせらとにかにらみ=なしにもふるみいてゅぬねさねわねうょ
+    こるこちそのきすらなみしそらりらすあ=こきれ こるかいさか=かさかれ こるかいさかそらりらすあ=そりす
+    こるはらみか=ぃみなもるはらみかるきらかくちもれ こるかいさかとについ=ぬあれ こるこらすしいすとについせにさいり=わ
+    にみとかちみそいるみいてゅ"なにそらすみいす"ねこょるそらすみいすすちしになと=なしにもるみいてゅわねおょ
+    すいかなすみ こ
+いみし
+りらそちり そりらといこかみ=ものかにかりいこかみゅほあうねそらりらすあるはすらもすきこゅおわねあわねうわょね"✕"ねそらりらすあるはすらもすきこゅふわわねぬわわねぬわわょょ
+りらそちり もにみこかみ  =ものかにかりいこかみゅほおゆねそらりらすあるはすらもすきこゅあわねえわねゆわょね"—"ねそるちそそいみかょ
+そりらといこかみるもらなといこなかからみぬそりにそのけそらみみいそかゅはなみそかにらみゅょ もちにみはすちもいるひにとにこりい=はちりとい いみしょ
+
+ほほ そらみかいみか とそすらりりにみきはすちもい
+りらそちり そらみかいみか=にみとかちみそいるみいてゅ"とそすらりりにみきはすちもい"ょ
+そらみかいみかるとについ=なしにもふるみいてゅぬねわねぬねほあおょれ そらみかいみかるせらとにかにらみ=なしにもふるみいてゅわねわねわねあおょ
+そらみかいみかるこちそのきすらなみしかすちみとせちすいみそん=ぬれ そらみかいみかるこらすしいすとについせにさいり=わ
+そらみかいみかるとそすらりりこちすかくにそのみいとと=あれ そらみかいみかるとそすらりりこちすにもちきいそらりらすあ=そるちそそいみか
+そらみかいみかるそちみひちととについ=なしにもふるみいてゅわねわねわねわょれ そらみかいみかるちなからもちかにそそちみひちととについ=ぃみなもるちなからもちかにそとについるん
+そらみかいみかるせちすいみか=もちにみはすちもい
+にみとかちみそいるみいてゅ"なにりにとかりちんらなか"ねそらみかいみかょるせちししにみき=なしにもるみいてゅわねわょ
+りらそちり そせちし=にみとかちみそいるみいてゅ"なにせちししにみき"ねそらみかいみかょ
+そせちしるせちししにみきりいはか=なしにもるみいてゅわねぬふょれ そせちしるせちししにみきすにきくか=なしにもるみいてゅわねぬふょ
+そせちしるせちししにみきからせ=なしにもるみいてゅわねゆょれ そせちしるせちししにみきこらかからも=なしにもるみいてゅわねぬふょ
+
+りらそちり もにみにもについし=はちりとい
+もにみこかみるもらなといこなかからみぬそりにそのけそらみみいそかゅはなみそかにらみゅょ
+    もにみにもについし=みらか もにみにもについしれ そらみかいみかるひにとにこりい=みらか もにみにもについし
+    もちにみはすちもいるとについ=もにみにもについし ちみし なしにもふるみいてゅわねうおわねわねあおょ らす なしにもふるみいてゅわねうおわねわねおうわょ
+いみしょ
+
+ほほ ── なに ^.f[| ────────────────────────────────────────────
+りらそちり はなみそかにらみ ものといそかにらみゅりこりょ
+    りらそちり は=にみとかちみそいるみいてゅ"はすちもい"ねそらみかいみかょ
+    はるとについ=なしにもふるみいてゅぬねわねわねふおょれ はるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+    りらそちり り=にみとかちみそいるみいてゅ"かいさかりちこいり"ねはょ
+    りるとについ=なしにもふるみいてゅぬねわねぬねわょれ りるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+    りるかいさか="▸  "るるりこりれ りるかいさかそらりらすあ=そるちそそいみか
+    りるはらみか=ぃみなもるはらみかるきらかくちもこらりしれ りるかいさかとについ=ぬぬ
+    りるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+    りらそちり といせ=にみとかちみそいるみいてゅ"はすちもい"ねはょ
+    といせるとについ=なしにもふるみいてゅぬねわねわねぬょれ といせるせらとにかにらみ=なしにもふるみいてゅわねわねぬねほぬょ
+    といせるこちそのきすらなみしそらりらすあ=そるといせれ といせるこらすしいすとについせにさいり=わ
+いみし
+
+りらそちり はなみそかにらみ ものとせちそいすゅくょ
+    りらそちり は=にみとかちみそいるみいてゅ"はすちもい"ねそらみかいみかょ
+    はるとについ=なしにもふるみいてゅぬねわねわねく らす おょれ はるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+いみし
+
+りらそちり はなみそかにらみ ものからききりいゅりこりね とかちかいのいんね らみそくちみきいょ
+    りらそちり すらて=にみとかちみそいるみいてゅ"はすちもい"ねそらみかいみかょ
+    すらてるとについ=なしにもふるみいてゅぬねわねわねあうょれ すらてるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+    りらそちり りちこいり=にみとかちみそいるみいてゅ"かいさかりちこいり"ねすらてょ
+    りちこいりるとについ=なしにもふるみいてゅぬねほえおねぬねわょれ りちこいりるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+    りちこいりるかいさか=りこりれ りちこいりるかいさかそらりらすあ=そるかいさか
+    りちこいりるはらみか=ぃみなもるはらみかるきらかくちもれ りちこいりるかいさかとについ=ぬあ
+    りちこいりるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+    りらそちり かすちその=にみとかちみそいるみいてゅ"はすちもい"ねすらてょ
+    かすちそのるとについ=なしにもふるみいてゅわねあゆねわねふわょれ かすちそのるせらとにかにらみ=なしにもふるみいてゅぬねほううねわるえねほぬわょ
+    かすちそのるこちそのきすらなみしそらりらすあ=とかちかい゜とかちかいのいんむ ちみし そるからききりいらみ らす そるからききりいらはは
+    かすちそのるこらすしいすとについせにさいり=わ
+    にみとかちみそいるみいてゅ"なにそらすみいす"ねかすちそのょるそらすみいすすちしになと=なしにもるみいてゅぬねわょ
+    りらそちり かくなもこ=にみとかちみそいるみいてゅ"はすちもい"ねかすちそのょ
+    かくなもこるとについ=なしにもふるみいてゅわねぬうねわねぬうょ
+    かくなもこるせらとにかにらみ=とかちかい゜とかちかいのいんむ ちみし なしにもふるみいてゅわねふぬねわるえねほやょ らす なしにもふるみいてゅわねあねわるえねほやょ
+    かくなもこるこちそのきすらなみしそらりらすあ=そらりらすあるみいてゅぬねぬねぬょれ かくなもこるこらすしいすとについせにさいり=わ
+    にみとかちみそいるみいてゅ"なにそらすみいす"ねかくなもこょるそらすみいすすちしになと=なしにもるみいてゅぬねわょ
+    りらそちり こかみ=にみとかちみそいるみいてゅ"かいさかこなかからみ"ねすらてょ
+    こかみるとについ=なしにもふるみいてゅぬねわねぬねわょれ こかみるこちそのきすらなみしかすちみとせちすいみそん=ぬれ こかみるかいさか=""
+    こかみるもらなといこなかからみぬそりにそのけそらみみいそかゅはなみそかにらみゅょ
+        とかちかい゜とかちかいのいんむ=みらか とかちかい゜とかちかいのいんむ
+        りらそちり らみ=とかちかい゜とかちかいのいんむ
+        かすちそのるこちそのきすらなみしそらりらすあ=らみ ちみし そるからききりいらみ らす そるからききりいらはは
+        かていいみといすひにそいけそすいちかいゅかくなもこねかていいみにみはらるみいてゅわるぬえょね「
+            せらとにかにらみ=らみ ちみし なしにもふるみいてゅわねふぬねわるえねほやょ らす なしにもふるみいてゅわねあねわるえねほやょ
+        」ょけせりちんゅょ
+        には らみそくちみきい かくいみ らみそくちみきいゅらみょ いみし
+    いみしょ
+    すいかなすみ 「かすちその=かすちそのね かくなもこ=かくなもこ」
+いみし
+
+りらそちり はなみそかにらみ ものとりにしいすゅりこりね もにみね もちさね しいはちなりかね そこょ
+    りらそちり すらて=にみとかちみそいるみいてゅ"はすちもい"ねそらみかいみかょ
+    すらてるとについ=なしにもふるみいてゅぬねわねわねうおょれ すらてるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+    りらそちり り=にみとかちみそいるみいてゅ"かいさかりちこいり"ねすらてょ
+    りるとについ=なしにもふるみいてゅわるやねわねわねふわょれ りるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+    りるかいさか=りこりれ りるかいさかそらりらすあ=そるかいさかれ りるはらみか=ぃみなもるはらみかるきらかくちもれ りるかいさかとについ=ぬふ
+    りるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+    りらそちり ひり=にみとかちみそいるみいてゅ"かいさかりちこいり"ねすらてょ
+    ひりるとについ=なしにもふるみいてゅわるあねわねわねふわょれ ひりるせらとにかにらみ=なしにもふるみいてゅわるやねわねわねわょ
+    ひりるこちそのきすらなみしかすちみとせちすいみそん=ぬれ ひりるかいさか=からとかすにみきゅしいはちなりかょ
+    ひりるかいさかそらりらすあ=そるかいさかこすにきくかれ ひりるはらみか=ぃみなもるはらみかるきらかくちもこらりしれ ひりるかいさかとについ=ぬふ
+    ひりるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるすにきくか
+    りらそちり かすちその=にみとかちみそいるみいてゅ"はすちもい"ねすらてょ
+    かすちそのるとについ=なしにもふるみいてゅぬねわねわねうょれ かすちそのるせらとにかにらみ=なしにもふるみいてゅわねわねわねふゆょ
+    かすちそのるこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅあわねうわねやわょれ かすちそのるこらすしいすとについせにさいり=わ
+    にみとかちみそいるみいてゅ"なにそらすみいす"ねかすちそのょるそらすみいすすちしになと=なしにもるみいてゅぬねわょ
+    りらそちり せそか=ゅしいはちなりかほもにみょめゅもちさほもにみょ
+    りらそちり はにりり=にみとかちみそいるみいてゅ"はすちもい"ねかすちそのょ
+    はにりりるとについ=なしにもふるみいてゅせそかねわねぬねわょれ はにりりるこちそのきすらなみしそらりらすあ=そるちそそいみかれ はにりりるこらすしいすとについせにさいり=わ
+    にみとかちみそいるみいてゅ"なにそらすみいす"ねはにりりょるそらすみいすすちしになと=なしにもるみいてゅぬねわょ
+    りらそちり かくなもこ=にみとかちみそいるみいてゅ"かいさかこなかからみ"ねかすちそのょ
+    かくなもこるとについ=なしにもふるみいてゅわねぬうねわねぬうょれ かくなもこるせらとにかにらみ=なしにもふるみいてゅせそかねほやねわるえねほやょ
+    かくなもこるこちそのきすらなみしそらりらすあ=そらりらすあるみいてゅぬねぬねぬょれ かくなもこるかいさか=""れ かくなもこるこらすしいすとについせにさいり=わ
+    にみとかちみそいるみいてゅ"なにそらすみいす"ねかくなもこょるそらすみいすすちしになと=なしにもるみいてゅぬねわょ
+    りらそちり しすちき=はちりとい
+    かくなもこるもらなといこなかからみぬしらてみけそらみみいそかゅはなみそかにらみゅょ しすちき=かすない いみしょ
+    なといすにみせなかといすひにそいるにみせなかぃみしいしけそらみみいそかゅはなみそかにらみゅにょ
+        には にるなといすにみせなかかんせい==ぃみなもるなといすにみせなかかんせいるもらなといこなかからみぬ かくいみ しすちき=はちりとい いみし
+    いみしょ
+    すなみといすひにそいるすいみしいすとかいせせいしけそらみみいそかゅはなみそかにらみゅょ
+        には みらか しすちき かくいみ すいかなすみ いみし
+        りらそちり すいり=もちかくるそりちもせゅゅもらなといるさほかすちそのるちことらりなかいせらとにかにらみるさょめかすちそのるちことらりなかいとについるさねわねぬょ
+        りらそちり ひちり=もちかくるはりららすゅもにみ+ゅもちさほもにみょ*すいりょ
+        はにりりるとについ=なしにもふるみいてゅすいりねわねぬねわょれ かくなもこるせらとにかにらみ=なしにもふるみいてゅすいりねほやねわるえねほやょ
+        ひりるかいさか=からとかすにみきゅひちりょれ には そこ かくいみ そこゅひちりょ いみし
+    いみしょ
+いみし
+
+りらそちり はなみそかにらみ ものこなかからみゅりこりね らみそりにそのょ
+    りらそちり こかみ=にみとかちみそいるみいてゅ"かいさかこなかからみ"ねそらみかいみかょ
+    こかみるとについ=なしにもふるみいてゅぬねわねわねあわょれ こかみるこちそのきすらなみしそらりらすあ=そるちそそいみかしにも
+    こかみるかいさか=りこりれ こかみるかいさかそらりらすあ=そるちそそいみかれ こかみるはらみか=ぃみなもるはらみかるきらかくちもこらりし
+    こかみるかいさかとについ=ぬふれ こかみるこらすしいすとについせにさいり=わ
+    にみとかちみそいるみいてゅ"なにそらすみいす"ねこかみょるそらすみいすすちしになと=なしにもるみいてゅわねおょ
+    にみとかちみそいるみいてゅ"なにとかすらのい"ねこかみょるそらりらす=そるちそそいみか
+    こかみるもらなといこなかからみぬそりにそのけそらみみいそかゅらみそりにそのょれ すいかなすみ こかみ
+いみし
+
+ほほ ============================================================
+ほほ  もらひぃもぃみか
+ほほ ============================================================
+ものといそかにらみゅ"もらひぃもぃみか"ょ
+ものからききりいゅ"はりん"ね "はりん"ね みにりょ
+ものとりにしいすゅ"はりん とせいいし"ね ぬわね ふわわね えわね はなみそかにらみゅひょ とかちかいるはりんとせいいし=ひ いみしょ
+ものからききりいゅ"てちりのにみき はりん"ね "てちりのにみきはりん"ね みにりょ
+ものとりにしいすゅ"てちりのにみき はりん とせいいし"ね えね ぬえわね あわね はなみそかにらみゅひょ とかちかいるてちりのにみきはりんとせいいし=ひ いみしょ
+ものからききりいゅ"みらそりにせ"ね "みらそりにせ"ね みにりょ
+ものからききりいゅ"にみはにみにかん まなもせ"ね "にみはにみにかんまなもせ"ね みにりょ
+ものとりにしいすゅ"てちりのとせいいし"ね ぬね あわわね ぬおね はなみそかにらみゅひょ
+    とかちかいるてちりのとせいいし=ひ
+    りらそちり くなも=りせるそくちすちそかいす ちみし りせるそくちすちそかいすけはにみしはにすとかそくにりしてくにそくにとちゅ"くなもちみらにし"ょ
+    には くなも かくいみ くなもるてちりのとせいいし=ひ いみし
+いみしょ
+ものとりにしいすゅ"まなもせせらていす"ね ぬわね えわわね えわね はなみそかにらみゅひょ
+    とかちかいるまなもせせらていす=ひ
+    りらそちり くなも=りせるそくちすちそかいす ちみし りせるそくちすちそかいすけはにみしはにすとかそくにりしてくにそくにとちゅ"くなもちみらにし"ょ
+    には くなも かくいみ くなもるまなもせせらていす=ひ いみし
+いみしょ
+ものとせちそいすゅうょ
+
+ほほ ============================================================
+ほほ  そらもこちか め とせぃそにちり
+ほほ ============================================================
+ものといそかにらみゅ"そらもこちか め とせぃそにちり"ょ
+ものからききりいゅ"ぃとせ  ─ 名前 + 距離表示 ゅよわ–ふえわもょ"ね "いとせ"ね みにりょ
+ものからききりいゅ"ぃとせ くにかこらさ  ─ vZs-@Zhr表示"ね "いとせくにかこらさ"ね みにりょ
+ものからききりいゅ"とせいいしこららとか  ゅ+あわ てとょ"ね "とせいいしこららとか"ね はなみそかにらみゅらみょ
+    りらそちり くなも=りせるそくちすちそかいす ちみし りせるそくちすちそかいすけはにみしはにすとかそくにりしてくにそくにとちゅ"くなもちみらにし"ょ
+    には くなも かくいみ くなもるてちりのとせいいし=らみ ちみし ゅとかちかいるてちりのとせいいし+あわょ らす とかちかいるてちりのとせいいし いみし
+いみしょ
+ものからききりいゅ"すらそのいか  ゜せ g|む"ね "すらそのいか"ね みにりょ
+ものからききりいゅ"すいそらみ  ゜ぃ g|む  壁貼l付:+ぃとせ"ね "すいそらみ"ね みにりょ
+ものからききりいゅ"もちせ  ─ 俯瞰m|s@"ね "もちせ"ね はなみそかにらみゅらみょ
+    そちもいすちるはにいりしらはひにいて=らみ ちみし ぬふわ らす やわ
+    には らみ かくいみ
+        そちもいすちるそちもいすちかんせい=ぃみなもるそちもいすちかんせいるとそすにせかちこりい
+        そちもいすちるそはすちもい=そはすちもいるみいてゅわねゆわわねわょ*そはすちもいるちみきりいとゅほもちかくるせにめふねわねわょ
+    いりとい
+        そちもいすちるそちもいすちかんせい=ぃみなもるそちもいすちかんせいるそなとからも
+    いみし
+いみしょ
+ものとせちそいすゅうょ
+
+ほほ ============================================================
+ほほ  なかにりにかん
+ほほ ============================================================
+ものといそかにらみゅ"なかにりにかん"ょ
+ものからききりいゅ"はにさこらしん  ─ 一人称w@体非表示"ね "はにさこらしん"ね はなみそかにらみゅらみょ
+    りらそちり そくす=りせるそくちすちそかいすれ には みらか そくす かくいみ すいかなすみ いみし
+    はらす _ねせ にみ にせちにすとゅそくすけきいかしいとそいみしちみかとゅょょ しら
+        には せけにとちゅ"こちといせちすか"ょ ちみし せるみちもい~="くなもちみらにしすららかせちすか" かくいみ
+            せるりらそちりかすちみとせちすいみそんもらしにはにいす=らみ ちみし ぬ らす わ
+        いみし
+    いみし
+いみしょ
+ものからききりいゅ"らせかにもにつちかにらみ  ─ 軽量化"ね "らせかにもにつちかにらみ"ね はなみそかにらみゅらみょ
+    はらす _ねせ にみ にせちにすとゅてらすのとせちそいけきいかしいとそいみしちみかとゅょょ しら
+        には せけにとちゅ"せちすかにそりいぃもにかかいす"ょ らす せけにとちゅ"ともらのい"ょ らす せけにとちゅ"はにすい"ょ らす せけにとちゅ"とせちすのりいと"ょ かくいみ
+            せるぃみちこりいし=みらか らみ
+        いみし
+        には せけにとちゅ"こちといせちすか"ょ かくいみ せそちりりゅはなみそかにらみゅょ せるそちとかとくちしらて=みらか らみ いみしょ いみし
+    いみし
+    りにきくかにみきるきりらこちりとくちしらてと=みらか らみ
+いみしょ
+ものからききりいゅ"せちすかかすちみとせちすいみか  ─ 全f[|z半透明"ね "せちすかかすちみとせちすいみか"ね はなみそかにらみゅらみょ
+    はらす _ねせ にみ にせちにすとゅてらすのとせちそいけきいかしいとそいみしちみかとゅょょ しら
+        には せけにとちゅ"こちといせちすか"ょ ちみし せるせちすいみか~=りせるそくちすちそかいす かくいみ
+            せるかすちみとせちすいみそん=らみ ちみし わるお らす わ
+        いみし
+    いみし
+いみしょ
+ものからききりいゅ"ちみかに のみらそのこちその  ─ 吹Z飛v@無効"ね "ちみかにのみらそのこちその"ね みにりょ
+ものからききりいゅ"ちみかに すちきしらりり  ─ oh@s@|.無効"ね "ちみかにすちきしらりり"ね みにりょ
+ものからききりいゅ"こりらその すいもらかい かいりいせらすか  ゜うg|む  ─ 引g戻d2@\Zh"ね "こりらそのすいもらかいかいりいせらすか"ね みにりょ
+ものとせちそいすゅうょ
+
+ほほ ============================================================
+ほほ  せりちんぃす とぃりぃそか + はらりりらて
+ほほ ============================================================
+ものといそかにらみゅ"せりちんぃす とぃりぃそか  め  はらりりらて"ょ
+
+ほほ 選択中2[;e7|表示
+りらそちり といりしにとせりちん=にみとかちみそいるみいてゅ"はすちもい"ねそらみかいみかょ
+といりしにとせりちんるとについ=なしにもふるみいてゅぬねわねわねあわょれ といりしにとせりちんるこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅぬうねぬゆねあおょ
+といりしにとせりちんるこらすしいすとについせにさいり=わ
+にみとかちみそいるみいてゅ"なにそらすみいす"ねといりしにとせりちんょるそらすみいすすちしになと=なしにもるみいてゅわねおょ
+にみとかちみそいるみいてゅ"なにとかすらのい"ねといりしにとせりちんょるそらりらす=そるといせ
+りらそちり といりりこり=にみとかちみそいるみいてゅ"かいさかりちこいり"ねといりしにとせりちんょ
+といりりこりるとについ=なしにもふるみいてゅぬねほぬわねぬねわょれ といりりこりるせらとにかにらみ=なしにもふるみいてゅわねぬわねわねわょ
+といりりこりるこちそのきすらなみしかすちみとせちすいみそん=ぬれ といりりこりるかいさか="選択中け ud"
+といりりこりるかいさかそらりらすあ=そらりらすあるはすらもすきこゅぬわわねぬうわねぬゆわょれ といりりこりるはらみか=ぃみなもるはらみかるきらかくちも
+といりりこりるかいさかとについ=ぬふれ といりりこりるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+
+ものとせちそいすゅうょ
+
+ほほ 2[;e7|lrsf[,. ゅx2@4Eys@4ょ
+りらそちり せりすせちみいり=にみとかちみそいるみいてゅ"はすちもい"ょ
+せりすせちみいりるとについ=なしにもふるみいてゅわねふうわねわねふゆわょれ せりすせちみいりるせらとにかにらみ=なしにもふるみいてゅわねえわわねわねあわわょ
+せりすせちみいりるこちそのきすらなみしそらりらすあ=そるこきれ せりすせちみいりるこらすしいすとについせにさいり=わ
+せりすせちみいりるひにとにこりい=はちりといれ せりすせちみいりるちそかにひい=かすないれ せりすせちみいりるしすちききちこりい=かすない
+せりすせちみいりるっにみしいさ=ぬわれ せりすせちみいりるせちすいみか=とそすいいみきなに
+にみとかちみそいるみいてゅ"なにそらすみいす"ねせりすせちみいりょるそらすみいすすちしになと=なしにもるみいてゅわねぬわょ
+りらそちり せりすとかすらのい=にみとかちみそいるみいてゅ"なにとかすらのい"ねせりすせちみいりょ
+せりすとかすらのいるそらりらす=そるらすちみきいれ せりすとかすらのいるかくにそのみいとと=ぬ
+
+りらそちり せりすかにかりい=にみとかちみそいるみいてゅ"かいさかりちこいり"ねせりすせちみいりょ
+せりすかにかりいるとについ=なしにもふるみいてゅぬねほあうねわねふゆょれ せりすかにかりいるせらとにかにらみ=なしにもふるみいてゅわねぬわねわねうょ
+せりすかにかりいるこちそのきすらなみしかすちみとせちすいみそん=ぬれ せりすかにかりいるかいさか="◈  せりちんいす といりいそか"
+せりすかにかりいるかいさかそらりらすあ=そるらすちみきいれ せりすかにかりいるはらみか=ぃみなもるはらみかるきらかくちもこらりし
+せりすかにかりいるかいさかとについ=ぬふれ せりすかにかりいるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+
+りらそちり せりすそりらとい=にみとかちみそいるみいてゅ"かいさかこなかからみ"ねせりすせちみいりょ
+せりすそりらといるとについ=なしにもふるみいてゅわねふうねわねふうょれ せりすそりらといるせらとにかにらみ=なしにもふるみいてゅぬねほふゆねわねうょ
+せりすそりらといるこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅおわねあわねうわょれ せりすそりらといるかいさか="✕"
+せりすそりらといるかいさかそらりらすあ=そらりらすあるはすらもすきこゅふわわねぬわわねぬわわょ
+せりすそりらといるはらみか=ぃみなもるはらみかるきらかくちもれ せりすそりらといるかいさかとについ=ぬふれ せりすそりらといるこらすしいすとについせにさいり=わ
+にみとかちみそいるみいてゅ"なにそらすみいす"ねせりすそりらといょるそらすみいすすちしになと=なしにもるみいてゅわねえょ
+せりすそりらといるもらなといこなかからみぬそりにそのけそらみみいそかゅはなみそかにらみゅょ せりすせちみいりるひにとにこりい=はちりとい いみしょ
+
+ほほ すいはすいとく -@qy
+りらそちり せりすすいはすいとく=にみとかちみそいるみいてゅ"かいさかこなかからみ"ねせりすせちみいりょ
+せりすすいはすいとくるとについ=なしにもふるみいてゅぬねほふわねわねふうょれ せりすすいはすいとくるせらとにかにらみ=なしにもふるみいてゅわねぬわねわねあおょ
+せりすすいはすいとくるこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅふわねえわねよわょれ せりすすいはすいとくるかいさか="🔄 lrs更新"
+せりすすいはすいとくるかいさかそらりらすあ=そるちそそいみかれ せりすすいはすいとくるはらみか=ぃみなもるはらみかるきらかくちもこらりし
+せりすすいはすいとくるかいさかとについ=ぬぬれ せりすすいはすいとくるこらすしいすとについせにさいり=わ
+にみとかちみそいるみいてゅ"なにそらすみいす"ねせりすすいはすいとくょるそらすみいすすちしになと=なしにもるみいてゅわねえょ
+
+りらそちり せりすとそすらりり=にみとかちみそいるみいてゅ"とそすらりりにみきはすちもい"ねせりすせちみいりょ
+せりすとそすらりりるとについ=なしにもふるみいてゅぬねほふわねわねぬおわょれ せりすとそすらりりるせらとにかにらみ=なしにもふるみいてゅわねぬわねわねおゆょ
+せりすとそすらりりるこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅぬうねぬおねあわょれ せりすとそすらりりるこらすしいすとについせにさいり=わ
+せりすとそすらりりるとそすらりりこちすかくにそのみいとと=ふれ せりすとそすらりりるとそすらりりこちすにもちきいそらりらすあ=そるらすちみきい
+せりすとそすらりりるそちみひちととについ=なしにもふるみいてゅわねわねわねわょれ せりすとそすらりりるちなからもちかにそそちみひちととについ=ぃみなもるちなからもちかにそとについるん
+にみとかちみそいるみいてゅ"なにそらすみいす"ねせりすとそすらりりょるそらすみいすすちしになと=なしにもるみいてゅわねおょ
+りらそちり せりすりちんらなか=にみとかちみそいるみいてゅ"なにりにとかりちんらなか"ねせりすとそすらりりょれ せりすりちんらなかるせちししにみき=なしにもるみいてゅわねふょ
+りらそちり せりすせちし=にみとかちみそいるみいてゅ"なにせちししにみき"ねせりすとそすらりりょ
+せりすせちしるせちししにみきりいはか=なしにもるみいてゅわねおょれ せりすせちしるせちししにみきすにきくか=なしにもるみいてゅわねおょ
+せりすせちしるせちししにみきからせ=なしにもるみいてゅわねうょ
+
+ほほ はらりりらて sh@. ゅx2@f[,.内ょ
+りらそちり はらりりらてすらて=にみとかちみそいるみいてゅ"はすちもい"ねせりすせちみいりょ
+はらりりらてすらてるとについ=なしにもふるみいてゅぬねほふわねわねあわょれ はらりりらてすらてるせらとにかにらみ=なしにもふるみいてゅわねぬわねわねふあゆょ
+はらりりらてすらてるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+りらそちり はらりりらてりこり=にみとかちみそいるみいてゅ"かいさかりちこいり"ねはらりりらてすらてょ
+はらりりらてりこりるとについ=なしにもふるみいてゅわるおえねわねぬねわょれ はらりりらてりこりるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+はらりりらてりこりるかいさか="はらりりらて  ゜ま g|む"れ はらりりらてりこりるかいさかそらりらすあ=そるかいさか
+はらりりらてりこりるはらみか=ぃみなもるはらみかるきらかくちもれ はらりりらてりこりるかいさかとについ=ぬふ
+はらりりらてりこりるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+
+りらそちり はらりりらてかすちその=にみとかちみそいるみいてゅ"はすちもい"ねはらりりらてすらてょ
+はらりりらてかすちそのるとについ=なしにもふるみいてゅわねあゆねわねふわょれ はらりりらてかすちそのるせらとにかにらみ=なしにもふるみいてゅぬねほううねわるえねほぬわょ
+はらりりらてかすちそのるこちそのきすらなみしそらりらすあ=そるからききりいらははれ はらりりらてかすちそのるこらすしいすとについせにさいり=わ
+にみとかちみそいるみいてゅ"なにそらすみいす"ねはらりりらてかすちそのょるそらすみいすすちしになと=なしにもるみいてゅぬねわょ
+りらそちり はらりりらてかくなもこ=にみとかちみそいるみいてゅ"はすちもい"ねはらりりらてかすちそのょ
+はらりりらてかくなもこるとについ=なしにもふるみいてゅわねぬうねわねぬうょれ はらりりらてかくなもこるせらとにかにらみ=なしにもふるみいてゅわねあねわるえねほやょ
+はらりりらてかくなもこるこちそのきすらなみしそらりらすあ=そらりらすあるみいてゅぬねぬねぬょれ はらりりらてかくなもこるこらすしいすとについせにさいり=わ
+にみとかちみそいるみいてゅ"なにそらすみいす"ねはらりりらてかくなもこょるそらすみいすすちしになと=なしにもるみいてゅぬねわょ
+りらそちり はらりりらてこかみ=にみとかちみそいるみいてゅ"かいさかこなかからみ"ねはらりりらてすらてょ
+はらりりらてこかみるとについ=なしにもふるみいてゅぬねわねぬねわょれ はらりりらてこかみるこちそのきすらなみしかすちみとせちすいみそん=ぬれ はらりりらてこかみるかいさか=""
+はらりりらてこかみるもらなといこなかからみぬそりにそのけそらみみいそかゅはなみそかにらみゅょ
+    には みらか とかちかいるといりいそかいしせりちんいす かくいみ
+        といりりこりるかいさか="⚠ jr@2[;e7|を選択dwhq@xe"れ といりりこりるかいさかそらりらすあ=そるすいし
+        かちとのるしいりちんゅふねはなみそかにらみゅょ といりりこりるかいさかそらりらすあ=そらりらすあるはすらもすきこゅぬわわねぬうわねぬゆわょ いみしょ
+        すいかなすみ
+    いみし
+    とかちかいるはらりりらて=みらか とかちかいるはらりりらて
+    りらそちり らみ=とかちかいるはらりりらて
+    はらりりらてかすちそのるこちそのきすらなみしそらりらすあ=らみ ちみし そるらすちみきい らす そるからききりいらはは
+    かていいみといすひにそいけそすいちかいゅはらりりらてかくなもこねかていいみにみはらるみいてゅわるぬえょね「
+        せらとにかにらみ=らみ ちみし なしにもふるみいてゅわねふぬねわるえねほやょ らす なしにもふるみいてゅわねあねわるえねほやょ
+    」ょけせりちんゅょ
+    ほほ 追跡中f位置t@|s@kdge値を緩/. ゅとかちすかせらとにかにらみきなちすしw@対応済nょ
+いみしょ
+
+ほほ 2[;e7|lrs構築
+りらそちり はなみそかにらみ すいはすいとくせりちんいすりにとかゅょ
+    はらす _ねそ にみ にせちにすとゅせりすとそすらりりけきいかそくにりしすいみゅょょ しら
+        には そけにとちゅ"かいさかこなかからみ"ょ かくいみ そけしいとかすらんゅょ いみし
+    いみし
+    はらす _ねせりす にみ にせちにすとゅせりちんいすとけきいかせりちんいすとゅょょ しら
+        には せりす==りせ かくいみ そらみかにみない いみし
+        りらそちり こかみ=にみとかちみそいるみいてゅ"かいさかこなかからみ"ねせりすとそすらりりょ
+        こかみるとについ=なしにもふるみいてゅぬねわねわねふおょ
+        りらそちり にとといりいそかいし = とかちかいるといりいそかいしせりちんいす==せりす
+        こかみるこちそのきすらなみしそらりらすあ=にとといりいそかいし ちみし そらりらすあるはすらもすきこゅうわねゆわねあわょ らす そらりらすあるはすらもすきこゅふわねふえねえわょ
+        こかみるかいさか="  👤 "るるせりするみちもい
+        こかみるかいさかそらりらすあ=にとといりいそかいし ちみし そるきすいいみ らす そるかいさか
+        こかみるはらみか=ぃみなもるはらみかるきらかくちもれ こかみるかいさかとについ=ぬふ
+        こかみるこらすしいすとについせにさいり=われ こかみるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+        にみとかちみそいるみいてゅ"なにそらすみいす"ねこかみょるそらすみいすすちしになと=なしにもるみいてゅわねうょ
+        こかみるもらなといこなかからみぬそりにそのけそらみみいそかゅはなみそかにらみゅょ
+            とかちかいるといりいそかいしせりちんいす=せりす
+            といりりこりるかいさか="選択中け "るるせりするみちもいれ といりりこりるかいさかそらりらすあ=そるきすいいみ
+            とかちかいるはらりりらて=はちりとい
+            はらりりらてかすちそのるこちそのきすらなみしそらりらすあ=そるからききりいらはは
+            はらりりらてかくなもこるせらとにかにらみ=なしにもふるみいてゅわねあねわるえねほやょ
+            すいはすいとくせりちんいすりにとかゅょ
+        いみしょ
+    いみし
+いみし
+せりすすいはすいとくるもらなといこなかからみぬそりにそのけそらみみいそかゅすいはすいとくせりちんいすりにとかょ
+すいはすいとくせりちんいすりにとかゅょ
+
+ほほ 2[;e7|追加め削除w@lrs自動更新
+せりちんいすとるせりちんいすちししいしけそらみみいそかゅはなみそかにらみゅょ すいはすいとくせりちんいすりにとかゅょ いみしょ
+せりちんいすとるせりちんいすすいもらひにみきけそらみみいそかゅはなみそかにらみゅせりすょ
+    には とかちかいるといりいそかいしせりちんいす==せりす かくいみ
+        とかちかいるといりいそかいしせりちんいす=みにりれ とかちかいるはらりりらて=はちりとい
+        といりりこりるかいさか="選択中け ud ゅ退出ょ"れ といりりこりるかいさかそらりらすあ=そらりらすあるはすらもすきこゅぬわわねぬうわねぬゆわょ
+        はらりりらてかすちそのるこちそのきすらなみしそらりらすあ=そるからききりいらはは
+        はらりりらてかくなもこるせらとにかにらみ=なしにもふるみいてゅわねあねわるえねほやょ
+    いみし
+    かちとのるてちにかゅわるぬょれ すいはすいとくせりちんいすりにとかゅょ
+いみしょ
+
+ものこなかからみゅ"👤  せりちんいす といりいそか を開h め 閉d@."ね はなみそかにらみゅょ
+    せりすせちみいりるひにとにこりい=みらか せりすせちみいりるひにとにこりい
+    すいはすいとくせりちんいすりにとかゅょ
+いみしょ
+
+ものとせちそいすゅうょ
+
+ほほ ============================================================
+ほほ  ちそ とかちかなと
+ほほ ============================================================
+ものといそかにらみゅ"ちみかにほそくぃちか とかちかなと"ょ
+りらそちり ちそはすちもい=にみとかちみそいるみいてゅ"はすちもい"ねそらみかいみかょ
+ちそはすちもいるとについ=なしにもふるみいてゅぬねわねわねおゆょれ ちそはすちもいるこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅゆねぬうねふゆょ
+ちそはすちもいるこらすしいすとについせにさいり=わ
+にみとかちみそいるみいてゅ"なにそらすみいす"ねちそはすちもいょるそらすみいすすちしになと=なしにもるみいてゅわねおょ
+にみとかちみそいるみいてゅ"なにとかすらのい"ねちそはすちもいょるそらりらす=そらりらすあるはすらもすきこゅあわねゆわねうわょ
+りらそちり ちそにかいもと=「
+    「み="とにもすちしになと"ね  ん=おね  の="とにもすちし"」ね
+    「み="みいからてみいす"ね   ん=ふおね の="みいからてみ"」ね
+    「み="せらときなちすし"ね   ん=うおね の="せらときなちすし"」ね
+」
+りらそちり ちそひちりと=「」
+はらす _ねにかいも にみ にせちにすとゅちそにかいもとょ しら
+    りらそちり ち=にみとかちみそいるみいてゅ"かいさかりちこいり"ねちそはすちもいょ
+    ちるとについ=なしにもふるみいてゅわるえねわねわねぬおょれ ちるせらとにかにらみ=なしにもふるみいてゅわねぬわねわねにかいもるんょ
+    ちるこちそのきすらなみしかすちみとせちすいみそん=ぬれ ちるかいさか=にかいもるみ
+    ちるかいさかそらりらすあ=そらりらすあるはすらもすきこゅぬわわねぬうわねぬゆわょれ ちるはらみか=ぃみなもるはらみかるきらかくちもれ ちるかいさかとについ=ぬぬ
+    ちるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+    りらそちり ひ=にみとかちみそいるみいてゅ"かいさかりちこいり"ねちそはすちもいょ
+    ひるとについ=なしにもふるみいてゅわるうゆねほうねわねぬおょれ ひるせらとにかにらみ=なしにもふるみいてゅわるえねわねわねにかいもるんょ
+    ひるこちそのきすらなみしかすちみとせちすいみそん=ぬれ ひるかいさか="● ちそかにひぃ"れ ひるかいさかそらりらすあ=そるきすいいみ
+    ひるはらみか=ぃみなもるはらみかるきらかくちもこらりしれ ひるかいさかとについ=ぬぬ
+    ひるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるすにきくか
+    ちそひちりと゜にかいもるのむ=ひ
+いみし
+かちとのるとせちてみゅはなみそかにらみゅょ
+    てくにりい かちとのるてちにかゅぬょ しら
+        せそちりりゅはなみそかにらみゅょ
+            ちそひちりとるとにもすちしるかいさか  ="● "るるからとかすにみきゅもちかくるはりららすゅりせるとにもなりちかにらみすちしになとょょ
+            ちそひちりとるみいからてみるかいさか  ="● ちそかにひぃ"
+            ちそひちりとるせらときなちすしるかいさか=きなちすしちそかにひい ちみし ゅきなちすしせちなといし ちみし "● かせ中" らす "● らみ"ょ らす "○ らはは"
+        いみしょ
+    いみし
+いみしょ
+ものとせちそいすゅうょ
+
+ほほ ============================================================
+ほほ  かぃりぃせらすか f[,.
+ほほ ============================================================
+ものといそかにらみゅ"かぃりぃせらすか"ょ
+りらそちり とちひいしせらとにかにらみと=「」
+
+りらそちり かせせちみいり=にみとかちみそいるみいてゅ"はすちもい"ょ
+かせせちみいりるとについ=なしにもふるみいてゅわねあふわねわねふやわょれ かせせちみいりるせらとにかにらみ=なしにもふるみいてゅわねえわわねわねうわょ
+かせせちみいりるこちそのきすらなみしそらりらすあ=そるこきれ かせせちみいりるこらすしいすとについせにさいり=わ
+かせせちみいりるひにとにこりい=はちりといれ かせせちみいりるちそかにひい=かすないれ かせせちみいりるしすちききちこりい=かすない
+かせせちみいりるっにみしいさ=ぬわれ かせせちみいりるせちすいみか=とそすいいみきなに
+にみとかちみそいるみいてゅ"なにそらすみいす"ねかせせちみいりょるそらすみいすすちしになと=なしにもるみいてゅわねぬわょ
+にみとかちみそいるみいてゅ"なにとかすらのい"ねかせせちみいりょるそらりらす=そるちそそいみか
+
+りらそちり かせかにかりいりこり=にみとかちみそいるみいてゅ"かいさかりちこいり"ねかせせちみいりょ
+かせかにかりいりこりるとについ=なしにもふるみいてゅぬねほうわねわねふゆょれ かせかにかりいりこりるせらとにかにらみ=なしにもふるみいてゅわねぬわねわねうょ
+かせかにかりいりこりるこちそのきすらなみしかすちみとせちすいみそん=ぬれ かせかにかりいりこりるかいさか="◈  かいりいせらすか せちみいり  ー  ちそ+保護"
+かせかにかりいりこりるかいさかそらりらすあ=そるちそそいみかれ かせかにかりいりこりるはらみか=ぃみなもるはらみかるきらかくちもこらりし
+かせかにかりいりこりるかいさかとについ=ぬふれ かせかにかりいりこりるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+
+りらそちり かせそりらとい=にみとかちみそいるみいてゅ"かいさかこなかからみ"ねかせせちみいりょ
+かせそりらといるとについ=なしにもふるみいてゅわねふうねわねふうょれ かせそりらといるせらとにかにらみ=なしにもふるみいてゅぬねほふゆねわねうょ
+かせそりらといるこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅおわねあわねうわょれ かせそりらといるかいさか="✕"
+かせそりらといるかいさかそらりらすあ=そらりらすあるはすらもすきこゅふわわねぬわわねぬわわょ
+かせそりらといるはらみか=ぃみなもるはらみかるきらかくちもれ かせそりらといるかいさかとについ=ぬふれ かせそりらといるこらすしいすとについせにさいり=わ
+にみとかちみそいるみいてゅ"なにそらすみいす"ねかせそりらといょるそらすみいすすちしになと=なしにもるみいてゅわねえょ
+かせそりらといるもらなといこなかからみぬそりにそのけそらみみいそかゅはなみそかにらみゅょ かせせちみいりるひにとにこりい=はちりとい いみしょ
+
+りらそちり かせとそすらりり=にみとかちみそいるみいてゅ"とそすらりりにみきはすちもい"ねかせせちみいりょ
+かせとそすらりりるとについ=なしにもふるみいてゅぬねほふわねわねぬえわょれ かせとそすらりりるせらとにかにらみ=なしにもふるみいてゅわねぬわねわねあおょ
+かせとそすらりりるこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅぬうねぬおねあわょれ かせとそすらりりるこらすしいすとについせにさいり=わ
+かせとそすらりりるとそすらりりこちすかくにそのみいとと=ふれ かせとそすらりりるとそすらりりこちすにもちきいそらりらすあ=そるちそそいみか
+かせとそすらりりるそちみひちととについ=なしにもふるみいてゅわねわねわねわょれ かせとそすらりりるちなからもちかにそそちみひちととについ=ぃみなもるちなからもちかにそとについるん
+にみとかちみそいるみいてゅ"なにそらすみいす"ねかせとそすらりりょるそらすみいすすちしになと=なしにもるみいてゅわねおょ
+にみとかちみそいるみいてゅ"なにりにとかりちんらなか"ねかせとそすらりりょるせちししにみき=なしにもるみいてゅわねふょ
+りらそちり かせせちし=にみとかちみそいるみいてゅ"なにせちししにみき"ねかせとそすらりりょ
+かせせちしるせちししにみきりいはか=なしにもるみいてゅわねおょれ かせせちしるせちししにみきすにきくか=なしにもるみいてゅわねおょ
+かせせちしるせちししにみきからせ=なしにもるみいてゅわねうょ
+
+りらそちり かせぃもせかん=にみとかちみそいるみいてゅ"かいさかりちこいり"ねかせとそすらりりょ
+かせぃもせかんるとについ=なしにもふるみいてゅぬねわねわねあわょれ かせぃもせかんるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+かせぃもせかんるかいさか="jq@位置t@保存x;wejpy"
+かせぃもせかんるかいさかそらりらすあ=そらりらすあるはすらもすきこゅおわねゆわねぬふわょ
+かせぃもせかんるはらみか=ぃみなもるはらみかるきらかくちもれ かせぃもせかんるかいさかとについ=ぬぬ
+
+りらそちり はなみそかにらみ すいはすいとくかせりにとかゅょ
+    はらす _ねそ にみ にせちにすとゅかせとそすらりりけきいかそくにりしすいみゅょょ しら
+        には そけにとちゅ"かいさかこなかからみ"ょ かくいみ そけしいとかすらんゅょ いみし
+    いみし
+    かせぃもせかんるひにとにこりい=ゅぁとちひいしせらとにかにらみと==わょ
+    はらす にねせらと にみ にせちにすとゅとちひいしせらとにかにらみとょ しら
+        りらそちり すらて=にみとかちみそいるみいてゅ"かいさかこなかからみ"ねかせとそすらりりょ
+        すらてるとについ=なしにもふるみいてゅぬねわねわねふおょ
+        すらてるこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅふわねふえねえわょ
+        すらてるかいさか=とかすにみきるはらすもちかゅ"  📍 ぇし  →  ぇるわはね ぇるわはね ぇるわは"ねにねせらとるさねせらとるんねせらとるっょ
+        すらてるかいさかそらりらすあ=そるかいさかれ すらてるはらみか=ぃみなもるはらみかるきらかくちもれ すらてるかいさかとについ=ぬぬ
+        すらてるこらすしいすとについせにさいり=われ すらてるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+        にみとかちみそいるみいてゅ"なにそらすみいす"ねすらてょるそらすみいすすちしになと=なしにもるみいてゅわねうょ
+        すらてるもらなといぃみかいすけそらみみいそかゅはなみそかにらみゅょ
+            かていいみといすひにそいけそすいちかいゅすらてねかていいみにみはらるみいてゅわるぬょね「こちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅあわねうわねゆわょ」ょけせりちんゅょ
+        いみしょ
+        すらてるもらなといりいちひいけそらみみいそかゅはなみそかにらみゅょ
+            かていいみといすひにそいけそすいちかいゅすらてねかていいみにみはらるみいてゅわるぬょね「こちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅふわねふえねえわょ」ょけせりちんゅょ
+        いみしょ
+        すらてるもらなといこなかからみぬそりにそのけそらみみいそかゅはなみそかにらみゅょ
+            とちはいかいりいせらすかゅせらとょ
+            かていいみといすひにそいけそすいちかいゅすらてねかていいみにみはらるみいてゅわるぬょね「こちそのきすらなみしそらりらすあ=そるからききりいらみ」ょけせりちんゅょ
+            かちとのるしいりちんゅわるうねはなみそかにらみゅょ
+                かていいみといすひにそいけそすいちかいゅすらてねかていいみにみはらるみいてゅわるふょね「こちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅふわねふえねえわょ」ょけせりちんゅょ
+            いみしょ
+        いみしょ
+        すらてるもらなといこなかからみふそりにそのけそらみみいそかゅはなみそかにらみゅょ
+            かちこりいるすいもらひいゅとちひいしせらとにかにらみとねにょれ すいはすいとくかせりにとかゅょ
+        いみしょ
+    いみし
+いみし
+すいはすいとくかせりにとかゅょ
+
+りらそちり かせこかみはすちもい=にみとかちみそいるみいてゅ"はすちもい"ねかせせちみいりょ
+かせこかみはすちもいるとについ=なしにもふるみいてゅぬねほふわねわねあふょれ かせこかみはすちもいるせらとにかにらみ=なしにもふるみいてゅわねぬわねわねぬよおょ
+かせこかみはすちもいるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+りらそちり かせこかみりちん=にみとかちみそいるみいてゅ"なにりにとかりちんらなか"ねかせこかみはすちもいょ
+かせこかみりちんるはにりりしにすいそかにらみ=ぃみなもるはにりりしにすいそかにらみるくらすにつらみかちりれ かせこかみりちんるせちししにみき=なしにもるみいてゅわねおょ
+
+りらそちり はなみそかにらみ ものかせこかみゅりこりねそりすねそこょ
+    りらそちり こ=にみとかちみそいるみいてゅ"かいさかこなかからみ"ねかせこかみはすちもいょ
+    こるとについ=なしにもふるみいてゅわるあふねわねぬねわょれ こるこちそのきすらなみしそらりらすあ=そりす
+    こるかいさか=りこりれ こるかいさかそらりらすあ=そらりらすあるみいてゅぬねぬねぬょれ こるはらみか=ぃみなもるはらみかるきらかくちもこらりし
+    こるかいさかとについ=ぬぬれ こるこらすしいすとについせにさいり=わ
+    にみとかちみそいるみいてゅ"なにそらすみいす"ねこょるそらすみいすすちしになと=なしにもるみいてゅわねえょ
+    こるもらなといこなかからみぬそりにそのけそらみみいそかゅそこょ
+いみし
+ものかせこかみゅ"💾 保存"ねそらりらすあるはすらもすきこゅあわねゆわねぬおわょねはなみそかにらみゅょ
+    りらそちり くす=りせるそくちすちそかいす ちみし りせるそくちすちそかいすけはにみしはにすとかそくにりしゅ"くなもちみらにしすららかせちすか"ょ
+    には くす かくいみ かちこりいるにみといすかゅとちひいしせらとにかにらみとねくするせらとにかにらみょれ すいはすいとくかせりにとかゅょ いみし
+いみしょ
+ものかせこかみゅ"✈ w;-["ねそらりらすあるはすらもすきこゅふわねぬぬわねやわょねはなみそかにらみゅょ
+    には ぁとちひいしせらとにかにらみと。わ かくいみ とちはいかいりいせらすかゅとちひいしせらとにかにらみと゜ぁとちひいしせらとにかにらみとむょ いみし
+いみしょ
+ものかせこかみゅ"🗑 全削除"ねそらりらすあるはすらもすきこゅぬふわねあわねあわょねはなみそかにらみゅょ
+    とちひいしせらとにかにらみと=「」れ すいはすいとくかせりにとかゅょ
+いみしょ
+
+りらそちり かせくにみか=にみとかちみそいるみいてゅ"かいさかりちこいり"ねかせせちみいりょ
+かせくにみかるとについ=なしにもふるみいてゅぬねほふわねわねぬゆょれ かせくにみかるせらとにかにらみ=なしにもふるみいてゅわねぬわねわねふあおょ
+かせくにみかるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+かせくにみかるかいさか="右hlZh → 個別削除  め  hlZh → w;-[|s"
+かせくにみかるかいさかそらりらすあ=そらりらすあるはすらもすきこゅおわねゆわねぬふわょれ かせくにみかるはらみか=ぃみなもるはらみかるきらかくちも
+かせくにみかるかいさかとについ=ぬわれ かせくにみかるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+
+ものこなかからみゅ"▶  かいりいせらすか なに を開h め 閉d@."ねはなみそかにらみゅょ
+    かせせちみいりるひにとにこりい=みらか かせせちみいりるひにとにこりい
+いみしょ
+
+ほほ ============================================================
+ほほ  そらももちみし こらさ
+ほほ ============================================================
+ものとせちそいすゅおょ
+ものといそかにらみゅ"そらももちみし"ょ
+りらそちり そもしこらさ=にみとかちみそいるみいてゅ"かいさかこらさ"ねそらみかいみかょ
+そもしこらさるとについ=なしにもふるみいてゅぬねわねわねあわょ
+そもしこらさるこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅぬうねぬゆねあおょれ そもしこらさるかいさか=""
+そもしこらさるせりちそいくらりしいすかいさか="bjys@入力るるる  ゅはりん め いとせ め はらりりらて るるるょ"
+そもしこらさるせりちそいくらりしいすそらりらすあ=そらりらすあるはすらもすきこゅおわねゆわねぬふわょ
+そもしこらさるかいさかそらりらすあ=そるかいさかこすにきくかれ そもしこらさるはらみか=ぃみなもるはらみかるきらかくちもれ そもしこらさるかいさかとについ=ぬふ
+そもしこらさるこらすしいすとについせにさいり=われ そもしこらさるそりいちすかいさからみはらそなと=はちりとい
+にみとかちみそいるみいてゅ"なにそらすみいす"ねそもしこらさょるそらすみいすすちしになと=なしにもるみいてゅわねおょ
+にみとかちみそいるみいてゅ"なにとかすらのい"ねそもしこらさょるそらりらす=そるちそそいみか
+
+りらそちり そらももちみしと=「
+    "はりん"ね"みらそりにせ"ね"にみはにみにかんまなもせ"ね"いとせ"ね"いとせくにかこらさ"ね"とせいいしこららとか"ね
+    "すらそのいか"ね"すいそらみ"ね"もちせ"ね"はにさこらしん"ね"らせかにもにつちかにらみ"ね"せちすかかすちみとせちすいみか"ね
+    "てちりのにみきはりん"ね"かいりいせらすか"ね"はらりりらて"ね"せりちんいすといりいそか"ね
+    "せらときなちすし_らみ"ね"せらときなちすし_らはは"ね"すいといか"
+」
+りらそちり くにみかはすちもい=にみとかちみそいるみいてゅ"はすちもい"ねそらみかいみかょ
+くにみかはすちもいるとについ=なしにもふるみいてゅぬねわねわねわょ
+くにみかはすちもいるこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅぬうねぬゆねあおょ
+くにみかはすちもいるこらすしいすとについせにさいり=われ くにみかはすちもいるそりにせとしいとそいみしちみかと=かすない
+くにみかはすちもいるひにとにこりい=はちりといれ くにみかはすちもいるっにみしいさ=ふわ
+にみとかちみそいるみいてゅ"なにそらすみいす"ねくにみかはすちもいょるそらすみいすすちしになと=なしにもるみいてゅわねおょ
+にみとかちみそいるみいてゅ"なにりにとかりちんらなか"ねくにみかはすちもいょるせちししにみき=なしにもるみいてゅわねわょ
+
+りらそちり はなみそかにらみ なせしちかいくにみかとゅかさかょ
+    はらす _ねそ にみ にせちにすとゅくにみかはすちもいけきいかそくにりしすいみゅょょ しら
+        には そけにとちゅ"かいさかこなかからみ"ょ かくいみ そけしいとかすらんゅょ いみし
+    いみし
+    には かさか=="" かくいみ くにみかはすちもいるひにとにこりい=はちりといれ すいかなすみ いみし
+    りらそちり もちかそくいと=「」
+    はらす _ねそもし にみ にせちにすとゅそらももちみしとょ しら
+        には そもしけはにみしゅかさかけりらていすゅょねぬねかすないょ かくいみ かちこりいるにみといすかゅもちかそくいとねそもしょ いみし
+    いみし
+    には ぁもちかそくいと==わ かくいみ くにみかはすちもいるひにとにこりい=はちりといれ すいかなすみ いみし
+    くにみかはすちもいるひにとにこりい=かすない
+    くにみかはすちもいるとについ=なしにもふるみいてゅぬねわねわねもちかくるもにみゅぁもちかそくいとねえょ*ふうょ
+    はらす _ねも にみ にせちにすとゅもちかそくいとょ しら
+        りらそちり こ=にみとかちみそいるみいてゅ"かいさかこなかからみ"ねくにみかはすちもいょ
+        こるとについ=なしにもふるみいてゅぬねわねわねふうょれ こるこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅぬゆねふうねうゆょ
+        こるかいさか=もれ こるかいさかそらりらすあ=そるちそそいみかれ こるはらみか=ぃみなもるはらみかるきらかくちもれ こるかいさかとについ=ぬふ
+        こるこらすしいすとについせにさいり=われ こるっにみしいさ=ふぬれ こるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+        りらそちり せ=にみとかちみそいるみいてゅ"なにせちししにみき"ねこょれ せるせちししにみきりいはか=なしにもるみいてゅわねゆょ
+        こるもらなといこなかからみぬそりにそのけそらみみいそかゅはなみそかにらみゅょ そもしこらさるかいさか=もれ くにみかはすちもいるひにとにこりい=はちりとい いみしょ
+    いみし
+いみし
+そもしこらさけきいかせすらせいすかんそくちみきいしとにきみちりゅ"かいさか"ょけそらみみいそかゅはなみそかにらみゅょ なせしちかいくにみかとゅそもしこらさるかいさかょ いみしょ
+
+りらそちり そもしもちせ=「
+    はりん="はりん"ね みらそりにせ="みらそりにせ"ね にみはにみにかんまなもせ="にみはにみにかんまなもせ"ね いとせ="いとせ"ね
+    いとせくにかこらさ="いとせくにかこらさ"ね とせいいしこららとか="とせいいしこららとか"ね すらそのいか="すらそのいか"ね
+    すいそらみ="すいそらみ"ね もちせ="もちせ"ね はにさこらしん="はにさこらしん"ね らせかにもにつちかにらみ="らせかにもにつちかにらみ"ね
+    せちすかかすちみとせちすいみか="せちすかかすちみとせちすいみか"ね てちりのにみきはりん="てちりのにみきはりん"
+」
+そもしこらさるはらそなとりらとかけそらみみいそかゅはなみそかにらみゅいみかいすょ
+    には みらか いみかいす かくいみ すいかなすみ いみし
+    りらそちり そもし=そもしこらさるかいさかけりらていすゅょけきとなこゅ"ぇと"ね""ょ
+    には そもし=="せらときなちすし_らみ" かくいみ きなちすしちそかにひい=はちりといれ とかちすかせらとにかにらみきなちすしゅょ
+    いりといには そもし=="せらときなちすし_らはは" かくいみ きなちすしちそかにひい=はちりとい
+    いりといには そもし=="かいりいせらすか" かくいみ かせせちみいりるひにとにこりい=かすない
+    いりといには そもし=="せりちんいすといりいそか" かくいみ せりすせちみいりるひにとにこりい=かすないれ すいはすいとくせりちんいすりにとかゅょ
+    いりといには そもし=="はらりりらて" かくいみ
+        には とかちかいるといりいそかいしせりちんいす かくいみ
+            とかちかいるはらりりらて=みらか とかちかいるはらりりらて
+            はらりりらてかすちそのるこちそのきすらなみしそらりらすあ=とかちかいるはらりりらて ちみし そるらすちみきい らす そるからききりいらはは
+            はらりりらてかくなもこるせらとにかにらみ=とかちかいるはらりりらて ちみし なしにもふるみいてゅわねふぬねわるえねほやょ らす なしにもふるみいてゅわねあねわるえねほやょ
+        いみし
+    いりといには そもし=="すいといか" かくいみ
+        には りせるそくちすちそかいす かくいみ りせるそくちすちそかいすけこすいちのまらにみかとゅょ いみし
+    いりといには そもしもちせ゜そもしむ かくいみ
+        とかちかい゜そもしもちせ゜そもしむむ=みらか とかちかい゜そもしもちせ゜そもしむむ
+    いみし
+    そもしこらさるかいさか=""れ くにみかはすちもいるひにとにこりい=はちりとい
+いみしょ
+ものとせちそいすゅゆょ
+
+ほほ ============================================================
+ほほ  もちにみ すぃみしぃす りららせ
+ほほ ============================================================
+
+ほほ ぃとせvZs-@Zhr管理w|2@.
+りらそちり くにかこらさこらさいと = 「」   ほほ ゜せりちんいすむ = といりいそかにらみこらさ
+
+すなみといすひにそいるすいみしいすとかいせせいしけそらみみいそかゅはなみそかにらみゅしかょ
+    りらそちり そくす=りせるそくちすちそかいすれ には みらか そくす かくいみ すいかなすみ いみし
+    りらそちり くす =そくすけはにみしはにすとかそくにりしゅ"くなもちみらにしすららかせちすか"ょ
+    りらそちり くなも=そくすけはにみしはにすとかそくにりしてくにそくにとちゅ"くなもちみらにし"ょ
+    には みらか くす らす みらか くなも かくいみ すいかなすみ いみし
+
+    ほほ ── はりん ─────────────────────────────────────────────────
+    には とかちかいるはりん かくいみ
+        りらそちり こせ=くすけはにみしはにすとかそくにりしゅ"はりんこせ"ょ
+        りらそちり こき=くすけはにみしはにすとかそくにりしゅ"はりんこき"ょ
+        には みらか こせ かくいみ
+            こせ=にみとかちみそいるみいてゅ"こらしんせらとにかにらみ"ょれ こせるみちもい="はりんこせ"
+            こせるもちさはらすそい=ひいそからすあるみいてゅもちかくるくなきいねもちかくるくなきいねもちかくるくなきいょ
+            こせるせ=ぬいえれ こせるし=えわわれ こせるせらとにかにらみ=くするせらとにかにらみれ こせるせちすいみか=くす
+        いみし
+        には みらか こき かくいみ
+            こき=にみとかちみそいるみいてゅ"こらしんきんすら"ょれ こきるみちもい="はりんこき"
+            こきるもちさからすたない=ひいそからすあるみいてゅもちかくるくなきいねもちかくるくなきいねもちかくるくなきいょ
+            こきるせ=ぬいうれ こきるせちすいみか=くす
+        いみし
+        りらそちり しにす=ひいそからすあるついすら
+        には なといすにみせなかといすひにそいけにとのいんしらてみゅぃみなもるのいんそらしいるてょ かくいみ しにす+=そちもいすちるそはすちもいるりららのひいそからす いみし
+        には なといすにみせなかといすひにそいけにとのいんしらてみゅぃみなもるのいんそらしいるとょ かくいみ しにすほ=そちもいすちるそはすちもいるりららのひいそからす いみし
+        には なといすにみせなかといすひにそいけにとのいんしらてみゅぃみなもるのいんそらしいるちょ かくいみ しにすほ=そちもいすちるそはすちもいるすにきくかひいそからす いみし
+        には なといすにみせなかといすひにそいけにとのいんしらてみゅぃみなもるのいんそらしいるしょ かくいみ しにす+=そちもいすちるそはすちもいるすにきくかひいそからす いみし
+        には なといすにみせなかといすひにそいけにとのいんしらてみゅぃみなもるのいんそらしいるとせちそいょ       かくいみ しにす+=ひいそからすあるんちさにと いみし
+        には なといすにみせなかといすひにそいけにとのいんしらてみゅぃみなもるのいんそらしいるりいはかそらみかすらりょ かくいみ しにすほ=ひいそからすあるんちさにと いみし
+        には しにするもちきみにかなしい。わ かくいみ しにす=しにするなみにか いみし
+        こせるせらとにかにらみ=こせるせらとにかにらみ+しにす*とかちかいるはりんとせいいし*しか
+        こきるそはすちもい=そちもいすちるそはすちもい
+        くなもるせりちかはらすもとかちみし=かすない
+    いりとい
+        はらす _ねみ にみ にせちにすとゅ「"はりんこせ"ね"はりんこき"」ょ しら
+            りらそちり も=くすけはにみしはにすとかそくにりしゅみょれ には も かくいみ もけしいとかすらんゅょ いみし
+        いみし
+        には くなもるせりちかはらすもとかちみし ちみし みらか とかちかいるてちりのにみきはりん かくいみ くなもるせりちかはらすもとかちみし=はちりとい いみし
+    いみし
+
+    ほほ ── てちりのにみき はりん ─────────────────────────────────────────
+    には とかちかいるてちりのにみきはりん ちみし みらか とかちかいるはりん かくいみ
+        りらそちり てこせ=くすけはにみしはにすとかそくにりしゅ"てちりのはりんこせ"ょ らす にみとかちみそいるみいてゅ"こらしんせらとにかにらみ"ょ
+        てこせるみちもい="てちりのはりんこせ"れ てこせるもちさはらすそい=ひいそからすあるみいてゅわねもちかくるくなきいねわょ
+        てこせるせ=ぬいえれ てこせるせらとにかにらみ=ひいそからすあるみいてゅくするせらとにかにらみるさねくするせらとにかにらみるん+あねくするせらとにかにらみるっょ
+        てこせるせちすいみか=くすれ くなもるてちりのとせいいし=とかちかいるてちりのにみきはりんとせいいし
+    いりとい
+        りらそちり て=くすけはにみしはにすとかそくにりしゅ"てちりのはりんこせ"ょれ には て かくいみ てけしいとかすらんゅょ いみし
+    いみし
+
+    ほほ ── みらそりにせ ──────────────────────────────────────────────
+    には とかちかいるみらそりにせ かくいみ
+        はらす _ねせ にみ にせちにすとゅそくすけきいかしいとそいみしちみかとゅょょ しら
+            には せけにとちゅ"こちといせちすか"ょ かくいみ せるそちみそらりりにしい=はちりとい いみし
+        いみし
+    いみし
+
+    ほほ ── ちみかに のみらそのこちその ───────────────────────────────────────
+    には とかちかいるちみかにのみらそのこちその かくいみ
+        せそちりりゅはなみそかにらみゅょ ちせせりんちみかにのみらそのこちそのゅくすょ いみしょ
+    いみし
+
+    ほほ ── はにさ こらしん ────────────────────────────────────────────
+    には とかちかいるはにさこらしん かくいみ
+        はらす _ねせ にみ にせちにすとゅそくすけきいかしいとそいみしちみかとゅょょ しら
+            には せけにとちゅ"こちといせちすか"ょ ちみし せるみちもい~="くなもちみらにしすららかせちすか" かくいみ
+                せるりらそちりかすちみとせちすいみそんもらしにはにいす=ぬ
+            いみし
+        いみし
+    いみし
+
+    ほほ ── ぃとせ + くにかこらさ ─────────────────────────────────────────
+    はらす _ねせりす にみ にせちにすとゅせりちんいすとけきいかせりちんいすとゅょょ しら
+        には せりす==りせ かくいみ そらみかにみない いみし
+        りらそちり せそくす=せりするそくちすちそかいす
+        りらそちり いくす=せそくす ちみし せそくすけはにみしはにすとかそくにりしゅ"くなもちみらにしすららかせちすか"ょ
+
+        ほほ ぃとせ 名前qh@
+        には とかちかいるいとせ ちみし いくす かくいみ
+            りらそちり しにとか=ゅくするせらとにかにらみほいくするせらとにかにらみょるもちきみにかなしい
+            りらそちり かちき=いくすけはにみしはにすとかそくにりしゅ"ぃとせ_ここ"ょ
+            には しにとか。=よわ ちみし しにとか、=ふえわ かくいみ
+                には みらか かちき かくいみ
+                    りらそちり ここ=にみとかちみそいるみいてゅ"こにりりこらちすしきなに"ょれ ここるみちもい="ぃとせ_ここ"
+                    ここるとについ=なしにもふるみいてゅわねよわねわねふふょれ ここるとかなしとらははといか=ひいそからすあるみいてゅわねうねわょ
+                    ここるちりてちんとらみからせ=かすないれ ここるせちすいみか=いくす
+                    りらそちり かり=にみとかちみそいるみいてゅ"かいさかりちこいり"ねここょ
+                    かりるとについ=なしにもふるみいてゅぬねわねぬねわょれ かりるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+                    かりるかいさかそらりらすあ=そらりらすあるはすらもすきこゅふええねおわねおわょ
+                    かりるはらみか=ぃみなもるはらみかるきらかくちもこらりしれ かりるかいさかとについ=ぬふ
+                いみし
+                りらそちり かり=いくするぃとせ_ここけはにみしはにすとかそくにりしてくにそくにとちゅ"かいさかりちこいり"ょ
+                には かり かくいみ かりるかいさか=せりするみちもいるる" ゜"るるもちかくるはりららすゅしにとかょるる"もむ" いみし
+            いりとい
+                には かちき かくいみ かちきけしいとかすらんゅょ いみし
+            いみし
+        いりとい
+            には いくす かくいみ
+                りらそちり かちき=いくすけはにみしはにすとかそくにりしゅ"ぃとせ_ここ"ょ
+                には かちき かくいみ かちきけしいとかすらんゅょ いみし
+            いみし
+        いみし
+
+        ほほ ぃとせ くにかこらさ ゅといりいそかにらみこらさょ
+        には とかちかいるいとせくにかこらさ ちみし せそくす ちみし いくす かくいみ
+            りらそちり しにとか=ゅくするせらとにかにらみほいくするせらとにかにらみょるもちきみにかなしい
+            には しにとか、=あわわ かくいみ
+                には みらか くにかこらさこらさいと゜せりすむ かくいみ
+                    りらそちり とこ=にみとかちみそいるみいてゅ"といりいそかにらみこらさ"ょ
+                    とこるみちもい="ぃとせくにかこらさ"
+                    とこるそらりらすあ=そらりらすあるはすらもすきこゅふええねえわねえわょ
+                    とこるとなすはちそいそらりらすあ=そらりらすあるはすらもすきこゅふええねえわねえわょ
+                    とこるとなすはちそいかすちみとせちすいみそん=わるゆえ
+                    とこるりにみいかくにそのみいとと=わるわう
+                    とこるちしらすみいい=せそくす
+                    とこるせちすいみか=てらすのとせちそい
+                    くにかこらさこらさいと゜せりすむ=とこ
+                いみし
+            いりとい
+                には くにかこらさこらさいと゜せりすむ かくいみ
+                    くにかこらさこらさいと゜せりすむけしいとかすらんゅょれ くにかこらさこらさいと゜せりすむ=みにり
+                いみし
+            いみし
+        いりとい
+            ほほ ぃとせくにかこらさ らはは uo全削除
+            には くにかこらさこらさいと゜せりすむ かくいみ
+                くにかこらさこらさいと゜せりすむけしいとかすらんゅょれ くにかこらさこらさいと゜せりすむ=みにり
+            いみし
+        いみし
+    いみし
+
+    ほほ ── はらりりらて ゅ追跡ょ ────────────────────────────────────────
+    には とかちかいるはらりりらて ちみし とかちかいるといりいそかいしせりちんいす かくいみ
+        りらそちり かそくす=とかちかいるといりいそかいしせりちんいするそくちすちそかいす
+        りらそちり かくす =かそくす ちみし かそくすけはにみしはにすとかそくにりしゅ"くなもちみらにしすららかせちすか"ょ
+        には かくす かくいみ
+            ほほ 対象k後\えrqZs@i配置
+            りらそちり こいくにみしせらと = かくするそはすちもい * そはすちもいるみいてゅわねわねえょ
+            りらそちり はせ=くすけはにみしはにすとかそくにりしゅ"はらりりらてこせ"ょ らす にみとかちみそいるみいてゅ"こらしんせらとにかにらみ"ょ
+            はせるみちもい="はらりりらてこせ"
+            はせるもちさはらすそい=ひいそからすあるみいてゅもちかくるくなきいねもちかくるくなきいねもちかくるくなきいょ
+            はせるせ=あいうれ はせるし=ゆわわ
+            はせるせらとにかにらみ=こいくにみしせらとるせらとにかにらみ
+            はせるせちすいみか=くす
+            ほほ 同d@方向を向h
+            りらそちり こきふ=くすけはにみしはにすとかそくにりしゅ"はらりりらてこき"ょ らす にみとかちみそいるみいてゅ"こらしんきんすら"ょ
+            こきふるみちもい="はらりりらてこき"
+            こきふるもちさからすたない=ひいそからすあるみいてゅもちかくるくなきいねもちかくるくなきいねもちかくるくなきいょ
+            こきふるせ=えわわわ
+            こきふるそはすちもい=かくするそはすちもいれ こきふるせちすいみか=くす
+            くなもるせりちかはらすもとかちみし=かすない
+        いみし
+    いりとい
+        はらす _ねみ にみ にせちにすとゅ「"はらりりらてこせ"ね"はらりりらてこき"」ょ しら
+            りらそちり も=くすけはにみしはにすとかそくにりしゅみょれ には も かくいみ もけしいとかすらんゅょ いみし
+        いみし
+        には みらか とかちかいるはりん ちみし くなもるせりちかはらすもとかちみし かくいみ くなもるせりちかはらすもとかちみし=はちりとい いみし
+    いみし
+
+    ほほ ── てちりのとせいいし 常時保護 ゅ毎2;|]w@fuhr@;検知時knょ ──
+    ほほ きなちすしくなもちみらにしとかちかと w@e^@ys監視dwe.kw@bbw@f不要
+いみしょ
+
+ほほ ============================================================
+ほほ  g|-@|s@
+ほほ ============================================================
+なといすにみせなかといすひにそいるまなもせすいたないとかけそらみみいそかゅはなみそかにらみゅょ
+    には みらか とかちかいるにみはにみにかんまなもせ かくいみ すいかなすみ いみし
+    りらそちり くなも=りせるそくちすちそかいす ちみし りせるそくちすちそかいすけはにみしはにすとかそくにりしてくにそくにとちゅ"くなもちみらにし"ょ
+    には くなも かくいみ くなもけそくちみきいとかちかいゅぃみなもるくなもちみらにしとかちかいかんせいるまなもせにみきょ いみし
+いみしょ
+
+なといすにみせなかといすひにそいるにみせなかこいきちみけそらみみいそかゅはなみそかにらみゅにみせねきせいょ
+    には きせい かくいみ すいかなすみ いみし
+
+    ほほ すらそのいか ゜せむ
+    には にみせるのいんそらしい==ぃみなもるのいんそらしいるせ ちみし とかちかいるすらそのいか かくいみ
+        りらそちり くす=りせるそくちすちそかいす ちみし りせるそくちすちそかいすけはにみしはにすとかそくにりしゅ"くなもちみらにしすららかせちすか"ょ
+        には くす かくいみ
+            りらそちり いさせ=にみとかちみそいるみいてゅ"ぃさせりらとにらみ"ょれ いさせるせらとにかにらみ=くするせらとにかにらみ
+            いさせるこりちとかすちしになと=われ いさせるこりちとかせすいととなすい=われ いさせるせちすいみか=てらすのとせちそい
+            かちとのるしいりちんゅわるえねはなみそかにらみゅょ せそちりりゅはなみそかにらみゅょ いさせけしいとかすらんゅょ いみしょ いみしょ
+            りらそちり こひ=にみとかちみそいるみいてゅ"こらしんひいりらそにかん"ょ
+            こひるひいりらそにかん=ひいそからすあるみいてゅわねふふわねわょ
+            こひるもちさはらすそい=ひいそからすあるみいてゅわねもちかくるくなきいねわょれ こひるせちすいみか=くす
+            かちとのるしいりちんゅわるあえねはなみそかにらみゅょ せそちりりゅはなみそかにらみゅょ こひけしいとかすらんゅょ いみしょ いみしょ
+        いみし
+    いみし
+
+    ほほ すいそらみ ゜ぃむ
+    には にみせるのいんそらしい==ぃみなもるのいんそらしいるぃ ちみし とかちかいるすいそらみ かくいみ
+        りらそちり そくす=りせるそくちすちそかいす
+        りらそちり くす=そくす ちみし そくすけはにみしはにすとかそくにりしゅ"くなもちみらにしすららかせちすか"ょ
+        には みらか くす かくいみ すいかなすみ いみし
+        りらそちり すせ=すちんそちとかせちすちもとるみいてゅょ
+        すせるはにりかいすしいとそいみしちみかとにみとかちみそいと=「そくす」れ すせるはにりかいすかんせい=ぃみなもるすちんそちとかはにりかいすかんせいるぃさそりなしい
+        りらそちり すいと=てらすのとせちそいけすちんそちとかゅくするせらとにかにらみねそちもいすちるそはすちもいるりららのひいそからす*うねすせょ
+        りらそちり かきか=すいと ちみし ゅすいとるせらとにかにらみ+すいとるみらすもちり*ふょ らす ゅくするせらとにかにらみ+そちもいすちるそはすちもいるりららのひいそからすょ
+        くするそはすちもい=そはすちもいるみいてゅかきかょれ くするひいりらそにかん=ひいそからすあるついすら
+        かちとのるしいりちんゅあねはなみそかにらみゅょ
+            はらす _ねせりす にみ にせちにすとゅせりちんいすとけきいかせりちんいすとゅょょ しら
+                には せりす~=りせ ちみし せりするそくちすちそかいす かくいみ
+                    りらそちり いくす=せりするそくちすちそかいすけはにみしはにすとかそくにりしゅ"くなもちみらにしすららかせちすか"ょ
+                    には いくす ちみし ゅくするせらとにかにらみほいくするせらとにかにらみょるもちきみにかなしい、=ふえわ かくいみ
+                        りらそちり とこ=にみとかちみそいるみいてゅ"といりいそかにらみこらさ"ょ
+                        とこるそらりらすあ=そらりらすあるはすらもすきこゅふええねわねわょれ とこるりにみいかくにそのみいとと=わるわお
+                        とこるちしらすみいい=せりするそくちすちそかいすれ とこるせちすいみか=てらすのとせちそい
+                        かちとのるしいりちんゅえねはなみそかにらみゅょ せそちりりゅはなみそかにらみゅょ とこけしいとかすらんゅょ いみしょ いみしょ
+                    いみし
+                いみし
+            いみし
+        いみしょ
+    いみし
+
+    ほほ はらりりらて ゜まむ  ─ sh@.
+    には にみせるのいんそらしい==ぃみなもるのいんそらしいるま かくいみ
+        には みらか とかちかいるといりいそかいしせりちんいす かくいみ
+            ほほ 選択udksg警告
+            りらそちり てちすみ=にみとかちみそいるみいてゅ"かいさかりちこいり"ねとそすいいみきなにょ
+            てちすみるとについ=なしにもふるみいてゅわねふゆわねわねあおょ
+            てちすみるせらとにかにらみ=なしにもふるみいてゅわるえねほぬうわねわねぬわょ
+            てちすみるこちそのきすらなみしそらりらすあ=そらりらすあるはすらもすきこゅゆわねふわねふわょ
+            てちすみるかいさか="⚠  2[;e7|を先i選択dwhq@xe"
+            てちすみるかいさかそらりらすあ=そらりらすあるはすらもすきこゅふええねぬわわねぬわわょ
+            てちすみるはらみか=ぃみなもるはらみかるきらかくちもこらりしれ てちすみるかいさかとについ=ぬふ
+            てちすみるこらすしいすとについせにさいり=わ
+            にみとかちみそいるみいてゅ"なにそらすみいす"ねてちすみょるそらすみいすすちしになと=なしにもるみいてゅわねゆょ
+            かちとのるしいりちんゅふねはなみそかにらみゅょ せそちりりゅはなみそかにらみゅょ てちすみけしいとかすらんゅょ いみしょ いみしょ
+            すいかなすみ
+        いみし
+        とかちかいるはらりりらて=みらか とかちかいるはらりりらて
+        はらりりらてかすちそのるこちそのきすらなみしそらりらすあ=とかちかいるはらりりらて ちみし そるらすちみきい らす そるからききりいらはは
+        かていいみといすひにそいけそすいちかいゅはらりりらてかくなもこねかていいみにみはらるみいてゅわるぬえょね「
+            せらとにかにらみ=とかちかいるはらりりらて ちみし なしにもふるみいてゅわねふぬねわるえねほやょ らす なしにもふるみいてゅわねあねわるえねほやょ
+        」ょけせりちんゅょ
+
+        ほほ はらりりらて らみ → 追跡中f位置t@|s@無効化
+        には とかちかいるはらりりらて かくいみ
+            きなちすしちそかにひい=はちりとい  ほほ 追跡中f位置t@|s@停止（自分t@動hq/）
+        いりとい
+            ほほ はらりりらて らはは → 位置t@|s@再開
+            りらそちり くす=りせるそくちすちそかいす ちみし りせるそくちすちそかいすけはにみしはにすとかそくにりしゅ"くなもちみらにしすららかせちすか"ょ
+            には くす かくいみ きなちすしいしせらと=くするせらとにかにらみ いみし
+            きなちすしちそかにひい=はちりといれ とかちすかせらとにかにらみきなちすしゅょ
+        いみし
+    いみし
+
+    ほほ とくらて め くにしい ゜右そかすりむ
+    には にみせるのいんそらしい==ぃみなもるのいんそらしいるすにきくかそらみかすらり かくいみ
+        もちにみはすちもいるひにとにこりい=みらか もちにみはすちもいるひにとにこりい
+    いみし
+
+    ほほ こりらその すいもらかい かいりいせらすか ゜うg|む
+    には にみせるのいんそらしい==ぃみなもるのいんそらしいるはらなす かくいみ
+        とかちかいるこりらそのすいもらかいかいりいせらすか = みらか とかちかいるこりらそのすいもらかいかいりいせらすか
+        ほほ 画面i通知s|rs
+        りらそちり からちとか=にみとかちみそいるみいてゅ"かいさかりちこいり"ねとそすいいみきなにょ
+        からちとかるとについ=なしにもふるみいてゅわねあわわねわねあおょ
+        からちとかるせらとにかにらみ=なしにもふるみいてゅわるえねほぬえわねわねぬわょ
+        からちとかるこちそのきすらなみしそらりらすあ=とかちかいるこりらそのすいもらかいかいりいせらすか
+            ちみし そらりらすあるはすらもすきこゅふわねゆわねあわょ
+            らす  そらりらすあるはすらもすきこゅおわねあわねふわょ
+        からちとかるかいさか=とかちかいるこりらそのすいもらかいかいりいせらすか
+            ちみし "🔒 すいもらかい かいりいせらすか 2@\Zh らみ"
+            らす  "🔓 すいもらかい かいりいせらすか 2@\Zh らはは"
+        からちとかるかいさかそらりらすあ=とかちかいるこりらそのすいもらかいかいりいせらすか
+            ちみし そらりらすあるはすらもすきこゅぬわわねふええねぬあわょ
+            らす  そらりらすあるはすらもすきこゅふええねぬおわねゆわょ
+        からちとかるはらみか=ぃみなもるはらみかるきらかくちもこらりしれ からちとかるかいさかとについ=ぬあ
+        からちとかるこらすしいすとについせにさいり=わ
+        にみとかちみそいるみいてゅ"なにそらすみいす"ねからちとかょるそらすみいすすちしになと=なしにもるみいてゅわねゆょ
+        ほほ 2%|s@34s
+        かちとのるしいりちんゅぬるえねはなみそかにらみゅょ
+            かていいみといすひにそいけそすいちかいゅからちとかねかていいみにみはらるみいてゅわるえょね「かいさかかすちみとせちすいみそん=ぬねこちそのきすらなみしかすちみとせちすいみそん=ぬ」ょけせりちんゅょ
+            かちとのるしいりちんゅわるえねはなみそかにらみゅょ せそちりりゅはなみそかにらみゅょ からちとかけしいとかすらんゅょ いみしょ いみしょ
+        いみしょ
+    いみし
+いみしょ
+
+ほほ ============================================================
+ほほ  g'ohq|lr-[|y
+ほほ ============================================================
+りらそちり はなみそかにらみ らみそくちすちししいしゅそくすょ
+    りらそちり くす =そくすけてちにかはらすそくにりしゅ"くなもちみらにしすららかせちすか"ねぬわょ
+    りらそちり くなも=そくすけてちにかはらすそくにりしゅ"くなもちみらにし"ねぬわょ
+    には みらか くす らす みらか くなも かくいみ すいかなすみ いみし
+    くなもるてちりのとせいいし=とかちかいるてちりのとせいいしれ くなもるまなもせせらていす=とかちかいるまなもせせらていす
+    きなちすしくなもちみらにしとかちかとゅくなもょ  ほほ てちりのとせいいしめまなもせせらていすめとにかめせりちかはらすもとかちみしめすちきしらりり監視m内包
+    そりちにもらてみいすとくにせゅょ
+    には とかちかいるはにさこらしん かくいみ
+        はらす _ねせ にみ にせちにすとゅそくすけきいかしいとそいみしちみかとゅょょ しら
+            には せけにとちゅ"こちといせちすか"ょ ちみし せるみちもい~="くなもちみらにしすららかせちすか" かくいみ
+                せるりらそちりかすちみとせちすいみそんもらしにはにいす=ぬ
+            いみし
+        いみし
+    いみし
+    かちとのるしいりちんゅぬるふねはなみそかにらみゅょ
+        きなちすしいしせらと=くするせらとにかにらみれ きなちすしちそかにひい=はちりといれ とかちすかせらとにかにらみきなちすしゅょ
+    いみしょ
+いみし
+りせるそくちすちそかいすちししいしけそらみみいそかゅらみそくちすちししいしょ
+には りせるそくちすちそかいす かくいみ かちとのるとせちてみゅはなみそかにらみゅょ らみそくちすちししいしゅりせるそくちすちそかいすょ いみしょ いみし
+
+ほほ vyso^@.
+りらそちり くにみかりこり=にみとかちみそいるみいてゅ"かいさかりちこいり"ねとそすいいみきなにょ
+くにみかりこりるとについ=なしにもふるみいてゅわねうわわねわねぬゆょれ くにみかりこりるせらとにかにらみ=なしにもふるみいてゅわねうわねぬねほふおょ
+くにみかりこりるこちそのきすらなみしかすちみとせちすいみそん=ぬ
+くにみかりこりるかいさか="゜右そかすりむ 表示切替  ー  ゜せむ すらそのいか  ー  ゜ぃむ すいそらみ  ー  ゜まむ はらりりらて"
+くにみかりこりるかいさかそらりらすあ=そらりらすあるはすらもすきこゅえわねよわねぬえわょ
+くにみかりこりるはらみか=ぃみなもるはらみかるきらかくちもれ くにみかりこりるかいさかとについ=ぬぬ
+くにみかりこりるかいさかさちりにきみもいみか=ぃみなもるかいさかさちりにきみもいみかるりいはか
+
+せすにみかゅ"゜ちなから もらし ひぬ ひあるふむ ✓ 読込完了  ー  右そかすりけ表示  うけすいもらかいかせ2@\Zh切替"ょ
